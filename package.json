@@ -1,0 +1,44 @@
+{
+  "name": "miniredis-ts",
+  "version": "0.1.0",
+  "description": "A Redis-compatible in-memory database server in TypeScript with zero runtime dependencies.",
+  "main": "dist/index.js",
+  "type": "module",
+  "engines": {
+    "node": ">=24"
+  },
+  "scripts": {
+    "dev": "tsx watch src/index.ts",
+    "build": "tsc -p tsconfig.build.json",
+    "start": "node dist/index.js",
+    "typecheck": "tsc --noEmit",
+    "lint": "eslint . && prettier --check .",
+    "format": "prettier --write .",
+    "test": "vitest run --passWithNoTests --project unit --project property --project integration",
+    "test:diff": "vitest run --project differential",
+    "test:crash": "npm run build && vitest run --project crash",
+    "test:fuzz": "vitest run --project fuzz",
+    "test:repl": "vitest run --project replication",
+    "test:all": "npm test && npm run test:diff && npm run test:crash && npm run test:fuzz && npm run test:repl",
+    "bench": "bash bench/run.sh"
+  },
+  "keywords": [
+    "redis",
+    "database",
+    "typescript"
+  ],
+  "license": "ISC",
+  "devDependencies": {
+    "@eslint/js": "^10.0.1",
+    "@types/node": "^26.6.6",
+    "@vitest/coverage-v8": "^5.1.0",
+    "eslint": "^10.14.0",
+    "fast-check": "^4.10.2",
+    "ioredis": "^6.0.0",
+    "prettier": "^3.10.1",
+    "tsx": "^4.23.15",
+    "typescript": "^6.0.3",
+    "typescript-eslint": "^8.72.2",
+    "vitest": "^5.1.0"
+  }
+}
