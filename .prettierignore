@@ -5,3 +5,4 @@ coverage
 package-lock.json
 docs/SPEC.md
 docs/PLAN.md
+docker-compose.yml

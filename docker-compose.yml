@@ -1,0 +1,31 @@
+services:
+  miniredis:
+    build: .
+    ports: ["127.0.0.1:6380:6380"]
+    volumes: ["miniredis-data:/data"]
+    command: ["--appendonly", "yes", "--appendfsync", "everysec", "--save", ""]
+
+  redis:   # the reference: differential tests, benchmarks, and the CLI tools
+    image: redis:7.4
+    ports: ["127.0.0.1:6379:6379"]
+    command: ["redis-server", "--appendonly", "yes", "--appendfsync", "everysec",
+              "--save", "", "--protected-mode", "no"]
+
+  replica1:
+    build: .
+    profiles: ["replication"]
+    ports: ["127.0.0.1:6381:6380"]
+    command: ["--replicaof", "miniredis", "6380"]
+    depends_on:
+      miniredis: { condition: service_healthy }
+
+  replica2:
+    build: .
+    profiles: ["replication"]
+    ports: ["127.0.0.1:6382:6380"]
+    command: ["--replicaof", "miniredis", "6380"]
+    depends_on:
+      miniredis: { condition: service_healthy }
+
+volumes:
+  miniredis-data:

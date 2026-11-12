@@ -1,0 +1,32 @@
+# CI skeleton (spec section 17). Suites that need Docker, a built server or a
+# long run join as their steps land: differential (step 8), docker build
+# (step 5), crash (step 15), replication (step 21), fuzz (step 22).
+name: CI
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-node@v5
+        with:
+          node-version: 26
+          cache: npm
+      - run: npm ci
+      - run: npm run lint
+      - run: npm run typecheck
+      - run: npm run build
+      - run: npm test -- --coverage
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: coverage
+          path: coverage/
+          if-no-files-found: ignore

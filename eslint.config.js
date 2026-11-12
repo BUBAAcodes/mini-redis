@@ -17,4 +17,10 @@ export default tseslint.config(
       'no-console': 'off',
     },
   },
+  {
+    // Plain JS run directly by Node (the Docker healthcheck); no-undef needs
+    // to know Node's globals, which typescript-eslint only covers for .ts.
+    files: ['docker/**/*.js'],
+    languageOptions: { globals: { process: 'readonly' } },
+  },
 );
