@@ -11,7 +11,7 @@
  * Mirrors Redis networking.c (processInlineBuffer, processMultibulkBuffer) and sds.c
  * (sdssplitargs). Behaviour was checked byte for byte against redis:7.4.
  */
-import { PROTOCOL, ProtocolError, expectedDollar } from './errors.js';
+import { PROTOCOL, ProtocolError, expectedDollar, expectedStar } from './errors.js';
 
 export interface ParsedCommand {
   argv: string[];
@@ -34,6 +34,14 @@ export const MAX_UNAUTH_BULK_LEN = 16 * 1024;
 export const MAX_INLINE_LEN = 64 * 1024;
 /** PROTO_MBULK_BIG_ARG: bulks this size or larger get their own buffer. */
 export const BIG_ARG = 32 * 1024;
+
+export interface ParserOptions {
+  /**
+   * Accept only multibulk frames with at least one argument, as the AOF loader does (Redis's
+   * loadSingleAppendOnlyFile): an inline line or an empty frame there is damage, not input.
+   */
+  multibulkOnly?: boolean;
+}
 
 const DEFAULT_LIMITS: ParserLimits = {
   maxBulkLen: () => 64 * 1024 * 1024,
@@ -73,11 +81,26 @@ export class RespParser {
   private consumed = 0; // bytes used so far by the command being parsed
   private failure: ProtocolError | null = null;
 
-  constructor(private readonly limits: ParserLimits = DEFAULT_LIMITS) {}
+  private readonly multibulkOnly: boolean;
+
+  constructor(
+    private readonly limits: ParserLimits = DEFAULT_LIMITS,
+    options: ParserOptions = {},
+  ) {
+    this.multibulkOnly = options.multibulkOnly ?? false;
+  }
 
   /** Unparsed input held in memory, for client-query-buffer-limit. */
   get bufferedBytes(): number {
     return this.buffered + (this.big === null ? 0 : this.big.length);
+  }
+
+  /**
+   * True while a command is partly read: unread bytes, or a multibulk whose header was taken
+   * but whose arguments haven't all arrived. At the end of an AOF this means a cut-off tail.
+   */
+  get pending(): boolean {
+    return this.buffered > 0 || this.argsLeft > 0 || this.big !== null;
   }
 
   feed(chunk: Buffer): void {
@@ -106,8 +129,13 @@ export class RespParser {
         if (n > 0) {
           this.argsLeft = n;
           this.argv = [];
+        } else if (this.multibulkOnly) {
+          throw new ProtocolError(PROTOCOL.INVALID_MULTIBULK);
         }
         // n <= 0: skipped like an empty line, as Redis does.
+      } else if (this.multibulkOnly) {
+        const first = this.chunks[this.head]![this.pos]!;
+        throw new ProtocolError(expectedStar(String.fromCharCode(first)));
       } else {
         const argv = this.inline();
         if (argv === null) return null;

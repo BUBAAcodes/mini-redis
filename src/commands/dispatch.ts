@@ -12,12 +12,17 @@
  * will abort; one that passes is queued and runs later through call(), the same path as a
  * normal command, so stats and propagation can't differ between the two.
  *
- * Mirrors Redis server.c (processCommand, rejectCommand, call) and multi.c (queueMultiCommand,
- * flagTransaction, discardTransaction, execCommandAbort).
+ * The AOF loader's client is obeyed: it skips the client-facing checks (MISCONF, subscriber
+ * mode, and later NOAUTH, READONLY and OOM), and while the server loads, call() keeps no stats
+ * and serves no blocked clients, so a replay changes nothing but the data.
+ *
+ * Mirrors Redis server.c (processCommand, rejectCommand, call, writeCommandsDeniedByDiskError)
+ * and multi.c (queueMultiCommand, flagTransaction, discardTransaction, execCommandAbort).
  */
 import {
   ERR,
   ReplyError,
+  misconf,
   subscriberContext,
   unknownCommand,
   unknownSubcommand,
@@ -68,7 +73,20 @@ export function dispatch(server: Server, client: Client, argv: readonly string[]
       return;
     }
   }
+  // The AOF loader's client is obeyed, as in Redis: nothing below applies to it.
+  if (client.isAofClient) {
+    if (client.multi && !RUN_INSIDE_MULTI.has(top.name)) client.queued.push({ spec, argv });
+    else call(server, client, spec, argv);
+    return;
+  }
   // 3 joins in step 22: NOAUTH.
+  // The AOF can't be written: refuse writes, and PING so health checks notice, until a write
+  // succeeds. Redis checks this between OOM and READONLY, ahead of subscriber mode.
+  const diskError = server.aof?.error ?? null;
+  if (diskError !== null && deniedByDiskError(client, spec, top.name)) {
+    reject(client, spec, misconf(diskError));
+    return;
+  }
   // 4. RESP2 subscriber mode: only the subscription commands, PING and QUIT.
   if (inSubscriberMode(client) && !SUBSCRIBER_COMMANDS.has(top.name)) {
     reject(client, spec, subscriberContext(spec.name));
@@ -86,6 +104,12 @@ export function dispatch(server: Server, client: Client, argv: readonly string[]
     return;
   }
   call(server, client, spec, argv);
+}
+
+/** A write, PING, or an EXEC whose queue holds a write (Redis's is_write_command). */
+function deniedByDiskError(client: Client, spec: CommandSpec, name: string): boolean {
+  if (spec.flags.includes('write') || name === 'ping') return true;
+  return name === 'exec' && client.queued.some((q) => q.spec.flags.includes('write'));
 }
 
 /**
@@ -149,8 +173,11 @@ export function call(
 
   // 9. Stats; SLOWLOG and MONITOR (step 23) also feed from here. A command that blocked is
   //    counted once, when it's served (it runs again) or times out, as in Redis.
-  server.stats.totalCommandsProcessed++;
-  if (!client.blocked) server.recordCommandStats(spec.name, usec);
+  //    Replaying the AOF counts nothing, as Redis's loader calls handlers directly.
+  if (!server.loading) {
+    server.stats.totalCommandsProcessed++;
+    if (!client.blocked) server.recordCommandStats(spec.name, usec);
+  }
   client.lastCommand = spec.name;
 
   // 10. Propagate: the command's own record only if it's a write that changed something.
@@ -159,5 +186,7 @@ export function call(
   // 11. Serve blocked clients whose keys became ready, after this command's record so each
   //    pop replays after the push that fed it, and after the whole EXEC rather than after
   //    each of its commands.
-  if (!options.inExec) server.waiters.handleClientsBlockedOnKeys();
+  //    Not while the AOF loads: a pop served mid-replay would change data the file doesn't
+  //    hold. Keys made ready by the replay are served once the command that loaded it ends.
+  if (!options.inExec && !server.loading) server.waiters.handleClientsBlockedOnKeys();
 }

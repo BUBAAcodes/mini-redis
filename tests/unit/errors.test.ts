@@ -5,6 +5,7 @@ import {
   ProtocolError,
   ReplyError,
   expectedDollar,
+  expectedStar,
   invalidExpireTime,
   misconf,
   subscriberContext,
@@ -71,6 +72,7 @@ describe('error strings (spec 7.4, checked against redis:7.4)', () => {
         'ERR DEBUG command not allowed. If the enable-debug-command option is set to "local", you can run it from a local connection, otherwise you need to set this option in the configuration file, and then restart the server.',
       INTERNAL: 'ERR internal error',
       NOT_ALLOWED_IN_MULTI: 'ERR Command not allowed inside a transaction',
+      AOF_LOAD_FAILED: 'ERR Error trying to load the AOF files, check server logs.',
     });
   });
 
@@ -87,6 +89,7 @@ describe('error strings (spec 7.4, checked against redis:7.4)', () => {
       MISSING_CRLF: "ERR Protocol error: expected '\\r\\n' after bulk",
     });
     expect(expectedDollar(':')).toBe("ERR Protocol error: expected '$', got ':'");
+    expect(expectedStar('g')).toBe("ERR Protocol error: expected '*', got 'g'");
   });
 
   it('formats unknown command like Redis, trailing space included', () => {

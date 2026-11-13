@@ -76,6 +76,7 @@ export const ERR = {
     'ERR DEBUG command not allowed. If the enable-debug-command option is set to "local", you can run it from a local connection, otherwise you need to set this option in the configuration file, and then restart the server.',
   INTERNAL: 'ERR internal error',
   NOT_ALLOWED_IN_MULTI: 'ERR Command not allowed inside a transaction',
+  AOF_LOAD_FAILED: 'ERR Error trying to load the AOF files, check server logs.',
 } as const;
 
 export const PROTOCOL = {
@@ -93,6 +94,10 @@ export const PROTOCOL = {
 
 export const expectedDollar = (got: string): string =>
   `ERR Protocol error: expected '$', got '${got}'`;
+
+/** Only the AOF loader asks for multibulk frames only; a client may send inline commands. */
+export const expectedStar = (got: string): string =>
+  `ERR Protocol error: expected '*', got '${got}'`;
 
 /** Redis formats args with %s, so a NUL byte ends one; we do the same. */
 const cString = (s: string): string => {

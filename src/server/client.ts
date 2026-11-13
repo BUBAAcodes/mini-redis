@@ -7,6 +7,10 @@
  * thousand commands that arrived in one chunk leaves in one write, and replies stay in the
  * order the commands came in (rule 12). Later steps add the monitor and replica fields here.
  *
+ * The AOF loader runs its commands on a client with no socket (Redis's fake client,
+ * CLIENT_ID_AOF): it is never registered with the server, its replies are thrown away, and it
+ * can never block.
+ *
  * Mirrors Redis networking.c (createClient, freeClient) and the client struct in server.h.
  */
 import type { Socket } from 'node:net';
@@ -64,14 +68,28 @@ export class Client {
   /** What a blocked BLPOP, BRPOP or BLMOVE waits for; the keys' FIFOs are in its Db. */
   bstate: BlockState | null = null;
 
+  /** `socket` is null only for the AOF loader's client. */
   constructor(
     readonly id: number,
-    readonly socket: Socket,
+    readonly socket: Socket | null,
     limits: ParserLimits,
   ) {
-    this.addr = `${socket.remoteAddress}:${socket.remotePort}`;
-    this.laddr = `${socket.localAddress}:${socket.localPort}`;
+    this.addr = socket === null ? '' : `${socket.remoteAddress}:${socket.remotePort}`;
+    this.laddr = socket === null ? '' : `${socket.localAddress}:${socket.localPort}`;
     this.parser = new RespParser(limits);
+  }
+
+  /** The AOF loader's client: it obeys every command, without the checks a user gets. */
+  get isAofClient(): boolean {
+    return this.socket === null;
+  }
+
+  /**
+   * A blocking command must answer at once instead of waiting: inside a transaction, and while
+   * replaying the AOF, where a wait could never end (Redis's CLIENT_DENY_BLOCKING).
+   */
+  get denyBlocking(): boolean {
+    return this.multi || this.socket === null;
   }
 
   get resp(): RespVersion {

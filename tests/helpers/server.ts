@@ -1,5 +1,6 @@
 // Starts a MiniRedis server in this process on port 0 with a fresh temp dir, and captures its
-// log lines instead of printing them. DEBUG is on, as spec 5 says tests run it.
+// log lines instead of printing them. DEBUG is on, as spec 5 says tests run it. A test that
+// passes its own `dir` (to restart a server on the same files) owns it: close() leaves it.
 import { mkdtemp, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -19,9 +20,10 @@ export async function startServer(
   directives: Record<string, string> = {},
   seed?: number,
 ): Promise<TestServer> {
-  const dir = await mkdtemp(join(tmpdir(), 'miniredis-test-'));
+  const ownDir = directives.dir === undefined;
+  const dir = directives.dir ?? (await mkdtemp(join(tmpdir(), 'miniredis-test-')));
   const config = Config.fromDirectives(
-    Object.entries({ port: '0', dir, 'enable-debug-command': 'yes', ...directives }).map(
+    Object.entries({ port: '0', 'enable-debug-command': 'yes', ...directives, dir }).map(
       ([name, value]) => ({
         args: [name, value],
         where: 'in a test',
@@ -39,7 +41,7 @@ export async function startServer(
     logs,
     async close() {
       await server.close();
-      await rm(dir, { recursive: true, force: true });
+      if (ownDir) await rm(dir, { recursive: true, force: true });
     },
   };
 }

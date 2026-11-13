@@ -20,8 +20,12 @@ export class EventLoop {
   /**
    * `beforeWrites` runs first in every beforeSleep, before anything is written: the server
    * runs the input of clients unblocked this turn there, so their replies join this flush.
+   * `writeAof` then hands the turn's AOF buffer to the OS (and fsyncs it under `always`).
    */
-  constructor(private readonly beforeWrites: () => void = () => {}) {}
+  constructor(
+    private readonly beforeWrites: () => void = () => {},
+    private readonly writeAof: () => void = () => {},
+  ) {}
 
   scheduleBeforeSleep(): void {
     if (this.scheduled) return;
@@ -46,8 +50,9 @@ export class EventLoop {
     // Unblocked clients' pipelined input first (Redis's processUnblockedClients): it can queue
     // replies and propagation records, which the steps below then write.
     this.beforeWrites();
-    // In this order, as later steps add them: REPLCONF GETACK for WAIT (step 20), the AOF
-    // write and fsync (12), the replication stream (20). Replies only after the AOF (rule 8).
+    // In this order: REPLCONF GETACK for WAIT (step 20), the AOF write and fsync, the
+    // replication stream (20). Replies only after the AOF (rule 8).
+    this.writeAof();
     for (const client of this.pendingWrites) writeClient(client);
     this.pendingWrites.clear();
     // Output buffer limits (step 22) are enforced here.
@@ -55,8 +60,8 @@ export class EventLoop {
 }
 
 function writeClient(client: Client): void {
-  if (client.closed) return;
   const socket = client.socket;
+  if (client.closed || socket === null) return;
   if (client.reply.pendingBytes > 0) {
     // One string per client, one write: cork/uncork keeps it one writev once later steps
     // write big bulks as separate buffers.

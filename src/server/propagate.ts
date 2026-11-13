@@ -20,6 +20,9 @@
  * and the AOF sink must skip it, because the AOF stores data, not messages. The marker lives on
  * the record rather than in a second path so ordering against other records stays exact.
  *
+ * While the AOF loads, the propagator is paused: replaying a record must never write it again
+ * (spec 9.5: loading never propagates).
+ *
  * Mirrors Redis server.c (call, alsoPropagate, propagatePendingCommands,
  * preventCommandPropagation, forceCommandPropagation with PROPAGATE_REPL).
  */
@@ -42,6 +45,8 @@ export class Propagator {
   private prevented = false;
   /** Records held back while an EXEC runs; null outside one. */
   private transaction: PropagationRecord[] | null = null;
+  /** True while the AOF loads: every record is dropped. */
+  paused = false;
 
   /** `wake` runs whenever a record goes out, so beforeSleep writes it this loop turn. */
   constructor(private readonly wake: () => void) {}
@@ -108,7 +113,7 @@ export class Propagator {
   }
 
   private emit(record: PropagationRecord): void {
-    if (this.sinks.size === 0) return;
+    if (this.paused || this.sinks.size === 0) return;
     if (this.transaction !== null) {
       this.transaction.push(record);
       return;

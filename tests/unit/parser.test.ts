@@ -1,6 +1,11 @@
 import fc from 'fast-check';
 import { describe, expect, it } from 'vitest';
-import { PROTOCOL, ProtocolError, expectedDollar } from '../../src/protocol/errors.js';
+import {
+  PROTOCOL,
+  ProtocolError,
+  expectedDollar,
+  expectedStar,
+} from '../../src/protocol/errors.js';
 import {
   BIG_ARG,
   MAX_INLINE_LEN,
@@ -329,5 +334,51 @@ describe('RespParser: chunking', () => {
     expect(cmds[0]!.bytes).toBe(input.length);
     expect(cmds[0]!.argv[2]!.length).toBe(size);
     expect(elapsed).toBeLessThan(2000);
+  });
+});
+
+describe('RespParser: multibulk-only mode (the AOF loader)', () => {
+  const strict = () => new RespParser(undefined, { multibulkOnly: true });
+  const errorOf = (input: string): string => {
+    const p = strict();
+    p.feed(bytes(input));
+    try {
+      while (p.next() !== null);
+    } catch (e) {
+      if (e instanceof ProtocolError) return e.message;
+      throw e;
+    }
+    return 'no error';
+  };
+
+  it('parses multibulk frames as usual', () => {
+    const p = strict();
+    p.feed(bytes(frame('SET', 'a', '1') + frame('GET', 'a')));
+    expect(drain(p).map((c) => c.argv)).toEqual([
+      ['SET', 'a', '1'],
+      ['GET', 'a'],
+    ]);
+  });
+
+  it('rejects inline lines, blank lines and empty frames instead of skipping them', () => {
+    expect(errorOf('garbage\r\n')).toBe(expectedStar('g'));
+    expect(errorOf(frame('PING') + '\r\n')).toBe(expectedStar('\r'));
+    expect(errorOf('*0\r\n')).toBe(PROTOCOL.INVALID_MULTIBULK);
+    expect(errorOf('*-1\r\n')).toBe(PROTOCOL.INVALID_MULTIBULK);
+  });
+
+  it('pending is true exactly while a command is partly read', () => {
+    const p = strict();
+    expect(p.pending).toBe(false);
+    const whole = frame('SET', 'a', '1');
+    for (let cut = 1; cut < whole.length; cut++) {
+      const q = strict();
+      q.feed(bytes(whole.slice(0, cut)));
+      expect(q.next()).toBeNull();
+      expect(q.pending, `cut at ${cut}`).toBe(true);
+    }
+    p.feed(bytes(whole));
+    expect(p.next()?.argv).toEqual(['SET', 'a', '1']);
+    expect(p.pending).toBe(false);
   });
 });

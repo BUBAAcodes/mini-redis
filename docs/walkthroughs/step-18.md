@@ -9,20 +9,20 @@ BLPOP, BRPOP and BLMOVE (`src/commands/lists.ts`), and `src/blocking/waiters.ts`
 Client A runs `BLPOP q 0` on an empty `q`; then client B runs `RPUSH q v`:
 
 1. A's BLPOP goes through `dispatch` and `call` to `blockingPopGeneric` (`lists.ts:233`). The timeout parses (`parseTimeout`, `waiters.ts:40`), `q` is missing, and A isn't in MULTI, so `waiters.block` runs (`lists.ts:250`, `waiters.ts:88`). It appends A to `db.blockingKeys['q']` and stores a `BlockState` on A. A zero timeout arms no timer. There's no reply.
-2. Back in `call`, A is now `blocked`, so its stats wait (`dispatch.ts:153`). A's `processInput` loop stops (`server.ts:233`), and anything A pipelined stays in its parser.
+2. Back in `call`, A is now `blocked`, so its stats wait (`dispatch.ts:179`). A's `processInput` loop stops (`server.ts:282`), and anything A pipelined stays in its parser.
 3. B's RPUSH runs `pushGeneric`, whose `signalModifiedKey` (`database.ts:248`) sees waiters on `q` and calls `signalKeyAsReady` (`waiters.ts:119`).
-4. B's `call` propagates `RPUSH q v`, then step 11 (`dispatch.ts:162`) calls `handleClientsBlockedOnKeys` (`waiters.ts:129`). `serveKey` (`waiters.ts:152`) finds `q` holding a list, unblocks A, and re-runs A's BLPOP through `call` (`waiters.ts:164`).
+4. B's `call` propagates `RPUSH q v`, then step 11 (`dispatch.ts:191`) calls `handleClientsBlockedOnKeys` (`waiters.ts:129`). `serveKey` (`waiters.ts:152`) finds `q` holding a list, unblocks A, and re-runs A's BLPOP through `call` (`waiters.ts:164`).
 5. This time `blockingPopGeneric` finds `v`. It pops, deletes the empty key, rewrites its propagation to `LPOP q` (`lists.ts:242`) and replies `[q, v]`. The re-run `call` propagates `LPOP q` after B's `RPUSH`, and its own step 11 returns at once because `serving` is set.
-6. `queueUnblocked` (`server.ts:183`) queues A's reply and A itself. In beforeSleep, `beforeWrites` (`event-loop.ts:48`) runs `processUnblockedClients` (`server.ts:259`), which runs A's buffered commands. Then both clients' replies are written.
+6. `queueUnblocked` (`server.ts:232`) queues A's reply and A itself. In beforeSleep, `beforeWrites` (`event-loop.ts:48`) runs `processUnblockedClients` (`server.ts:308`), which runs A's buffered commands. Then both clients' replies are written.
 
 ## Key functions and why each exists
 
-- **`Waiters.block` / `unblock` (`waiters.ts:88`, `:105`)**: the two halves of the registry. Each key holds a FIFO of clients in its Db, and each client holds its keys, deduplicated (`BLPOP q q 0` registers once), its deadline, its timer and its command. `unblock` is the one exit, used by serving, timeouts and `freeClient` (`server.ts:275`).
+- **`Waiters.block` / `unblock` (`waiters.ts:88`, `:105`)**: the two halves of the registry. Each key holds a FIFO of clients in its Db, and each client holds its keys, deduplicated (`BLPOP q q 0` registers once), its deadline, its timer and its command. `unblock` is the one exit, used by serving, timeouts and `freeClient` (`server.ts:324`).
 - **`handleClientsBlockedOnKeys` (`waiters.ts:129`)**: drains ready keys until none are left. A served BLMOVE pushes into its destination, which can make another key ready, so this loops. The `serving` flag stops a re-run command from serving recursively.
 - **`serveKey` (`waiters.ts:152`)**: walks a snapshot of the key's waiters, oldest first, re-running each while the key holds a list. Another type, or the list running out (the last pop deletes the key), leaves the rest waiting.
 - **`parseTimeout` (`waiters.ts:40`)**: Redis's `getTimeoutFromObjectOrReply`. Milliseconds are rounded up, so `0.0001` waits 1 ms and `-0.0001` means forever. The deadline must fit in int64.
 - **`onTimer` / `timerDelay` (`waiters.ts:176`, `:53`)**: a null array on timeout. Delays are capped at Node's 2^31−1 ms limit, and the timer re-arms for whatever is left.
-- **`processUnblockedClients` (`server.ts:259`)**: runs a woken client's pipelined input on a fresh stack in beforeSleep, never inside the command or timer that woke it.
+- **`processUnblockedClients` (`server.ts:308`)**: runs a woken client's pipelined input on a fresh stack in beforeSleep, never inside the command or timer that woke it.
 
 ## Trade-offs, and what Redis does differently
 
@@ -36,7 +36,7 @@ Tests: `tests/unit/waiters.test.ts` (timeout parsing, timer capping) and `tests/
 
 ## The single most important line
 
-`dispatch.ts:162`: `if (!options.inExec) server.waiters.handleClientsBlockedOnKeys();`. Without it a push never wakes anyone. Deleting it makes "BLPOP returns within 10 ms of another client's push" in `tests/integration/blocking.test.ts` hang until it times out. Every test after it then fails too, because the shared clients stay blocked (checked by deleting the line).
+`dispatch.ts:191`: `if (!options.inExec && !server.loading) server.waiters.handleClientsBlockedOnKeys();` (the `loading` test joined in step 12). Without it a push never wakes anyone. Deleting it makes "BLPOP returns within 10 ms of another client's push" in `tests/integration/blocking.test.ts` hang until it times out. Every test after it then fails too, because the shared clients stay blocked (checked by deleting the line).
 
 ## Quiz
 
@@ -49,6 +49,6 @@ Tests: `tests/unit/waiters.test.ts` (timeout parsing, timer capping) and `tests/
 
 1. A gets `v` and B gets `[dst, v]`. Records: `RPUSH src v`, then `LMOVE src dst LEFT RIGHT`, then `LPOP dst`. A's re-run LMOVE signals `dst`, which makes it ready, and the `handleClientsBlockedOnKeys` loop (`waiters.ts:129`) serves B in the same pass.
 2. `serveKey` runs inside another client's command (or inside EXEC). Running A's input there would nest A's commands inside B's: their propagation would interleave with B's step 11, and a command that blocks or serves again would recurse. Redis also defers it (`queueClientForReprocessing` → `processUnblockedClients` in beforeSleep).
-3. A transaction must run without waiting, or it would hold the single thread forever. `blockingPopGeneric` checks `client.multi`, which stays set while EXEC runs its queue (`transactions.ts:46`), and replies with a null array instead. EXEC returns `*1\r\n*-1\r\n`.
+3. A transaction must run without waiting, or it would hold the single thread forever. `blockingPopGeneric` checks `client.denyBlocking` (`lists.ts:246`), which is true while `client.multi` is, and `multi` stays set while EXEC runs its queue (`transactions.ts:46`), and replies with a null array instead. EXEC returns `*1\r\n*-1\r\n`.
 
 </details>

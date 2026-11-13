@@ -4,8 +4,9 @@
  * Key design choice: one interval timer, re-armed whenever CONFIG SET changes hz, and unref'd
  * so it never keeps a process alive by itself (tests start and stop many servers). Each chore
  * gets a small time budget so cron never becomes a long pause (rule 10). For now it refreshes
- * the LRU clock, expires keys and rehashes; save points and AOF rewrite (12–14), timeouts and
- * output limits (22), replication (20–21) and ops/sec sampling (23) join later.
+ * the LRU clock, expires keys, rehashes, and runs the AOF's retries and `everysec` fsync; save
+ * points and AOF rewrite (13–14), timeouts and output limits (22), replication (20–21) and
+ * ops/sec sampling (23) join later.
  *
  * Mirrors Redis server.c (serverCron, databasesCron).
  */
@@ -57,5 +58,7 @@ export class Cron {
       activeExpireCycle(this.server, this.interval * ACTIVE_EXPIRE_SHARE);
     }
     for (const db of this.server.dbs) db.cron(REHASH_MS);
+    // A failed AOF write is retried, and the `everysec` fsync started (spec 9.6).
+    this.server.aof?.cron();
   }
 }

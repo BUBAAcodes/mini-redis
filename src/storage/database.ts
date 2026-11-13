@@ -181,6 +181,9 @@ export class Db {
 
   /** Past its deadline at `cmdTime`, whether or not it has been deleted yet. Never deletes. */
   isExpired(key: string): boolean {
+    // Nothing expires while the AOF loads (Redis's keyIsExpired): the file already holds the
+    // DEL for every key that expired before it was written, and the rest go after loading.
+    if (this.server.loading) return false;
     const expireAt = this.expires.get(key);
     return expireAt !== undefined && this.server.cmdTime > expireAt;
   }
@@ -195,8 +198,7 @@ export class Db {
    * keyIsExpired) and returns whether it did. Lookups call it; so do SCAN and RANDOMKEY.
    */
   expireIfNeeded(key: string): boolean {
-    const expireAt = this.expires.get(key);
-    if (expireAt === undefined || this.server.cmdTime <= expireAt) return false;
+    if (!this.isExpired(key)) return false;
     // A replica (step 21) stops here: it hides the key and waits for its primary's DEL.
     this.deleteExpired(key);
     return true;

@@ -8,10 +8,15 @@
  * only leave in beforeSleep, so all commands that arrive in one loop turn are answered with
  * one write per client.
  *
+ * Startup follows spec 9.9: create `dir`, then (with `appendonly yes`) replay the AOF and open
+ * it for appending, all before the listener opens, so no client ever sees a half-loaded
+ * dataset. A damaged AOF makes start() reject; it never starts empty over good data.
+ *
  * Mirrors Redis server.c (initServer, the redisServer struct) and networking.c
  * (acceptTcpHandler, readQueryFromClient, processInputBuffer, freeClient).
  */
 import { randomBytes } from 'node:crypto';
+import { mkdirSync } from 'node:fs';
 import net from 'node:net';
 import type { Socket } from 'node:net';
 import { Waiters } from '../blocking/waiters.js';
@@ -20,6 +25,7 @@ import type { CommandTable } from '../commands/command.js';
 import { buildCommandTable } from '../commands/registry.js';
 import { Config } from '../config.js';
 import type { DictOptions } from '../datastructures/dict.js';
+import { Aof, aofPath, loadAof } from '../persistence/aof.js';
 import { ProtocolError } from '../protocol/errors.js';
 import { PubSubHub } from '../pubsub/hub.js';
 import { Db } from '../storage/database.js';
@@ -37,6 +43,11 @@ export interface ServerOptions {
   log?: (line: string) => void;
   /** Seed for every random choice, so a test can replay a run. */
   seed?: number;
+  /**
+   * Called after a fatal error is logged, when the server can't keep its promises (an AOF
+   * write failing under `appendfsync always`). Exits the process by default; tests observe it.
+   */
+  fatal?: (message: string) => void;
 }
 
 export interface Stats {
@@ -72,7 +83,10 @@ export class Server {
   readonly dbs: Db[];
   readonly clients = new Map<number, Client>();
   readonly commands: CommandTable = buildCommandTable();
-  readonly eventLoop = new EventLoop(() => this.processUnblockedClients());
+  readonly eventLoop = new EventLoop(
+    () => this.processUnblockedClients(),
+    () => this.aof?.flush(),
+  );
   readonly propagator = new Propagator(() => this.eventLoop.scheduleBeforeSleep());
   readonly cron: Cron;
   /** Channels and patterns (spec 9.11); a frame goes onto the client's output queue. */
@@ -101,12 +115,18 @@ export class Server {
   activeExpireEnabled = true;
   /** The db the next active-expiry cycle starts at (spec 9.3: resume where it stopped). */
   activeExpireDb = 0;
+  /** The open AOF while `appendonly yes`, else null. */
+  aof: Aof | null = null;
+  /** True while the AOF is replayed: nothing expires, propagates or counts in the stats. */
+  loading = false;
 
   /** Served or timed out this turn: their buffered input runs in the next beforeSleep. */
   private readonly unblockedClients = new Set<Client>();
   private nextClientId = 1;
   private listener: net.Server | null = null;
   private shuttingDown = false;
+  private detachAof: (() => void) | null = null;
+  private readonly onFatal: (message: string) => void;
 
   constructor(options: ServerOptions = {}) {
     this.config = options.config ?? new Config();
@@ -115,6 +135,7 @@ export class Server {
       role: () => 'M',
       ...(options.log ? { write: options.log } : {}),
     });
+    this.onFatal = options.fatal ?? (() => process.exit(1));
     this.rng = new Random(options.seed);
     this.dictOptions = { seed: this.rng.uint32(), rng: this.rng };
     this.dbs = Array.from({ length: this.config.get('databases') }, (_, i) => new Db(i, this));
@@ -124,8 +145,13 @@ export class Server {
     });
   }
 
-  /** Listens and starts serverCron. Resolves once connections are accepted. */
+  /**
+   * Loads the data, listens, and starts serverCron. Resolves once connections are accepted;
+   * rejects with AofLoadError (already logged) if the AOF is damaged.
+   */
   async start(): Promise<void> {
+    mkdirSync(this.config.get('dir'), { recursive: true });
+    if (this.config.get('appendonly')) this.openAof();
     const listener = net.createServer((socket) => this.accept(socket));
     this.listener = listener;
     await new Promise<void>((resolve, reject) => {
@@ -157,17 +183,40 @@ export class Server {
       if (listening === null) resolve();
       else listening.close(() => resolve());
     });
+    // Writes the AOF buffer, then the replies; then the AOF is fsynced (spec 9.14 step 2).
     this.eventLoop.beforeSleep();
+    this.closeAof();
     const sockets = [...this.clients.values()].map(
       (client) =>
         new Promise<void>((resolve) => {
-          client.socket.once('close', () => resolve());
-          if (client.socket.destroyed) resolve();
+          const socket = client.socket!;
+          socket.once('close', () => resolve());
+          if (socket.destroyed) resolve();
           client.closed = true;
-          client.socket.end(() => client.socket.destroy());
+          socket.end(() => socket.destroy());
         }),
     );
     await Promise.all([listenerClosed, ...sockets]);
+  }
+
+  /** Logs why the server can't go on, then exits (or tells the test that it would have). */
+  fatal(message: string): void {
+    this.log.warning(message);
+    this.onFatal(message);
+  }
+
+  /** Replays the AOF if there is one, then opens it for appending as a propagation sink. */
+  private openAof(): void {
+    const path = aofPath(this);
+    loadAof(this, path);
+    this.aof = new Aof(this, path);
+    this.detachAof = this.propagator.attach(this.aof);
+  }
+
+  private closeAof(): void {
+    this.detachAof?.();
+    this.detachAof = null;
+    this.aof?.close();
   }
 
   /** Queues a client for the next beforeSleep: it has replies (or a close) waiting. */
@@ -249,7 +298,7 @@ export class Server {
       );
       // No reply, as in Redis: the client gets nothing more.
       this.freeClient(client);
-      client.socket.destroy();
+      client.socket!.destroy();
       return;
     }
     if (client.reply.pendingBytes > 0 || client.closeAfterReply) this.queueReply(client);

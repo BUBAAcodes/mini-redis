@@ -171,7 +171,7 @@ describe('the read path', () => {
   it('answers a 1,000-command pipeline in order, in one write', async () => {
     const c = await connect();
     const id = (await c.call('CLIENT', 'ID')) as number;
-    const socket = t.server.clients.get(id)!.socket;
+    const socket = t.server.clients.get(id)!.socket!;
     let writes = 0;
     const write = socket.write.bind(socket) as (...args: unknown[]) => boolean;
     socket.write = ((...args: unknown[]) => {

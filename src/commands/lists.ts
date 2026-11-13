@@ -243,7 +243,7 @@ function blockingPopGeneric(ctx: CommandContext, end: End): void {
     ctx.reply.array([key, value]);
     return;
   }
-  if (ctx.client.multi) {
+  if (ctx.client.denyBlocking) {
     ctx.reply.nullArray();
     return;
   }
@@ -264,7 +264,7 @@ export function blmoveCommand(ctx: CommandContext): void {
   const timeout = parseTimeout(ctx.argv[5]!, ctx.server.cmdTime);
   const srcKey = ctx.argv[1]!;
   if (lookupWriteOfType(ctx, srcKey, 'list') === null) {
-    if (ctx.client.multi) ctx.reply.nullBulk();
+    if (ctx.client.denyBlocking) ctx.reply.nullBulk();
     else ctx.server.waiters.block(ctx, [srcKey], timeout);
     return;
   }
