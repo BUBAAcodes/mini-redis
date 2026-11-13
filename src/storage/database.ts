@@ -82,6 +82,46 @@ export class Db {
     return true;
   }
 
+  /** Moves `from`'s value (and TTL) to `to`, replacing whatever `to` held. Both are checked by RENAME. */
+  rename(from: string, to: string): void {
+    const obj = this.dict.get(from);
+    if (obj === undefined) throw new Error('Db.rename: source key missing');
+    const ttl = this.expires.get(from);
+    this.delete(to);
+    this.delete(from);
+    this.dict.set(to, obj);
+    if (ttl !== undefined) this.expires.set(to, ttl);
+  }
+
+  /**
+   * Empties the db and returns how many keys it held, which all count as changes for save
+   * points. The WATCH hook (step 16) and the snapshot hook (step 13) go here.
+   */
+  flush(): number {
+    const removed = this.dict.size;
+    this.dict.clear();
+    this.expires.clear();
+    this.server.dirty += removed;
+    return removed;
+  }
+
+  /** A random key, or null if the db is empty. Skipping expired keys joins in step 7. */
+  randomKey(): string | null {
+    return this.dict.randomEntry()?.[0] ?? null;
+  }
+
+  /** Every key: a full walk, for KEYS only (rule 10). Rehashing pauses while it runs. */
+  allKeys(): string[] {
+    const keys: string[] = [];
+    this.dict.forEach((key) => keys.push(key));
+    return keys;
+  }
+
+  /** One SCAN step: visits the keys at `cursor`, returns the next cursor (0 = done). */
+  scanStep(cursor: number, fn: (key: string, obj: RObj) => void): number {
+    return this.dict.scan(cursor, fn);
+  }
+
   /**
    * Called exactly once after a command changes a key. WATCH (step 16), blocked clients (18)
    * and memory accounting (19) join here; for now it counts the change for save points and

@@ -46,6 +46,10 @@ export const ERR = {
   OOM: "OOM command not allowed when used memory > 'maxmemory'.",
   NOPROTO: 'NOPROTO unsupported protocol version',
   MAX_CLIENTS: 'ERR max number of clients reached',
+  DECR_OVERFLOW: 'ERR decrement would overflow',
+  INVALID_CURSOR: 'ERR invalid cursor',
+  OFFSET_OUT_OF_RANGE: 'ERR offset is out of range',
+  STRING_TOO_LONG: 'ERR string exceeds maximum allowed size (proto-max-bulk-len)',
   BGSAVE_IN_PROGRESS: 'ERR Background save already in progress',
   INTERNAL: 'ERR internal error',
 } as const;

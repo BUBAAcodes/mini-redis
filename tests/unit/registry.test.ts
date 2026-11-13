@@ -14,22 +14,46 @@ const handlerName = (name: string): string =>
     .join('') + 'Command';
 
 describe('command table (spec 7.9)', () => {
-  it('has every step 5 command', () => {
+  it('has every command built so far (steps 5 and 6)', () => {
     const names = [...buildCommandTable().keys()].sort();
-    expect(names).toEqual([
-      'client',
-      'command',
-      'config',
-      'del',
-      'echo',
-      'get',
-      'info',
-      'ping',
-      'quit',
-      'select',
-      'set',
-      'time',
-    ]);
+    expect(names).toEqual(
+      [
+        'append',
+        'client',
+        'command',
+        'config',
+        'dbsize',
+        'decr',
+        'decrby',
+        'del',
+        'echo',
+        'exists',
+        'flushall',
+        'flushdb',
+        'get',
+        'getdel',
+        'getrange',
+        'incr',
+        'incrby',
+        'incrbyfloat',
+        'info',
+        'keys',
+        'mget',
+        'mset',
+        'ping',
+        'quit',
+        'randomkey',
+        'rename',
+        'scan',
+        'select',
+        'set',
+        'setrange',
+        'strlen',
+        'time',
+        'type',
+        'unlink',
+      ].sort(),
+    );
   });
 
   it('builds a fresh table per call', () => {

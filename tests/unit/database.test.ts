@@ -76,6 +76,44 @@ describe('Db (spec 6.1)', () => {
     db.dict.check();
   });
 
+  it('flush removes every key and TTL and returns how many', () => {
+    const { db } = newDb();
+    for (let i = 0; i < 50; i++) db.setKey(`k${i}`, createStringObject('v'));
+    db.expires.set('k1', Date.now() + 10_000);
+    expect(db.flush()).toBe(50);
+    expect(db.size).toBe(0);
+    expect(db.expires.size).toBe(0);
+    expect(db.flush()).toBe(0);
+  });
+
+  it('randomKey returns a live key, or null when empty', () => {
+    const { db } = newDb();
+    expect(db.randomKey()).toBeNull();
+    db.add('only', createStringObject('v'));
+    expect(db.randomKey()).toBe('only');
+  });
+
+  it('rename moves the value and keeps the TTL', () => {
+    const { db } = newDb();
+    db.add('a', createStringObject('1'));
+    db.add('b', createStringObject('old'));
+    db.expires.set('a', 12345);
+    db.rename('a', 'b');
+    expect(db.peek('a')).toBeNull();
+    expect(db.peek('b')?.value).toBe('1');
+    expect(db.expires.get('b')).toBe(12345);
+    expect(db.expires.has('a')).toBe(false);
+  });
+
+  it('rename drops the destination TTL when the source has none', () => {
+    const { db } = newDb();
+    db.add('a', createStringObject('1'));
+    db.add('b', createStringObject('2'));
+    db.expires.set('b', 999);
+    db.rename('a', 'b');
+    expect(db.expires.has('b')).toBe(false);
+  });
+
   it('the LRU clock is Unix seconds in 24 bits', () => {
     expect(lruClockNow(0)).toBe(0);
     expect(lruClockNow(1000 * 0x1000000 + 5000)).toBe(5);
