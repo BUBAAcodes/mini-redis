@@ -14,6 +14,7 @@ import { debugCommands } from './debug.js';
 import { hashCommands } from './hashes.js';
 import { keyCommands } from './keys.js';
 import { listCommands } from './lists.js';
+import { pubsubCommands } from './pubsub.js';
 import { serverCommands } from './server.js';
 import { setCommands } from './sets.js';
 import { stringCommands } from './strings.js';
@@ -31,6 +32,7 @@ export function buildCommandTable(): CommandTable {
     ...setCommands,
     ...zsetCommands,
     ...transactionCommands,
+    ...pubsubCommands,
     ...serverCommands,
     ...debugCommands,
   ]) {

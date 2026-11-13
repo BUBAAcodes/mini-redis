@@ -5,8 +5,8 @@
  * Key design choice: the output queue is the client's `Reply`. Handlers append to it, and only
  * beforeSleep turns it into socket writes, once per event-loop turn. So a pipeline of a
  * thousand commands that arrived in one chunk leaves in one write, and replies stay in the
- * order the commands came in (rule 12). Later steps add the pub/sub, blocking, monitor and
- * replica fields here.
+ * order the commands came in (rule 12). Later steps add the blocking, monitor and replica
+ * fields here.
  *
  * Mirrors Redis networking.c (createClient, freeClient) and the client struct in server.h.
  */
@@ -56,6 +56,10 @@ export class Client {
   queued: QueuedCommand[] = [];
   /** This client's WATCH entries; the other half of the registry is in each Db. */
   watchedKeys: WatchedKey[] = [];
+
+  /** Channels and patterns this client subscribes to; the hub holds the other half. */
+  readonly channels = new Set<string>();
+  readonly patterns = new Set<string>();
 
   constructor(
     readonly id: number,

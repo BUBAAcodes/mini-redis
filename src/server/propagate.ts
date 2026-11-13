@@ -16,13 +16,19 @@
  * sink needs a SELECT just for them. Spec 9.5 wraps every EXEC that wrote anything; Redis 7
  * skips the wrapper when there is only one record (docs/DIFFERENCES.md).
  *
+ * A record marked `replicasOnly` (PUBLISH, spec 9.5) is data-less: the replication sink sends it
+ * and the AOF sink must skip it, because the AOF stores data, not messages. The marker lives on
+ * the record rather than in a second path so ordering against other records stays exact.
+ *
  * Mirrors Redis server.c (call, alsoPropagate, propagatePendingCommands,
- * preventCommandPropagation).
+ * preventCommandPropagation, forceCommandPropagation with PROPAGATE_REPL).
  */
 
 export interface PropagationRecord {
   readonly db: number;
   readonly argv: readonly string[];
+  /** For replicas only: the AOF sink skips it. Absent means both sinks. */
+  readonly replicasOnly?: true;
 }
 
 export interface PropagationSink {
@@ -57,8 +63,8 @@ export class Propagator {
     this.rewritten = argv;
   }
 
-  alsoPropagate(db: number, argv: readonly string[]): void {
-    this.also.push({ db, argv });
+  alsoPropagate(db: number, argv: readonly string[], replicasOnly = false): void {
+    this.also.push(replicasOnly ? { db, argv, replicasOnly: true } : { db, argv });
   }
 
   prevent(): void {

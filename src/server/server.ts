@@ -20,6 +20,7 @@ import { buildCommandTable } from '../commands/registry.js';
 import { Config } from '../config.js';
 import type { DictOptions } from '../datastructures/dict.js';
 import { ProtocolError } from '../protocol/errors.js';
+import { PubSubHub } from '../pubsub/hub.js';
 import { Db } from '../storage/database.js';
 import { unwatchAllKeys } from '../storage/watch.js';
 import { Logger } from '../utils/logger.js';
@@ -73,6 +74,11 @@ export class Server {
   readonly eventLoop = new EventLoop();
   readonly propagator = new Propagator(() => this.eventLoop.scheduleBeforeSleep());
   readonly cron: Cron;
+  /** Channels and patterns (spec 9.11); a frame goes onto the client's output queue. */
+  readonly pubsub = new PubSubHub<Client>((client, frame) => {
+    client.reply.push(frame);
+    this.queueReply(client);
+  });
   /** 40 hex characters, new on every start (spec 7.7). */
   readonly runId = randomBytes(20).toString('hex');
   readonly startTime = Date.now();
@@ -238,7 +244,8 @@ export class Server {
     client.closed = true;
     this.clients.delete(client.id);
     this.eventLoop.forget(client);
-    // A gone client must not stay in any db's WATCH registry.
+    // A gone client must not stay in any db's WATCH registry or in the pub/sub hub.
     unwatchAllKeys(client);
+    this.pubsub.unsubscribeAll(client);
   }
 }

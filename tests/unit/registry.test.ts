@@ -14,7 +14,7 @@ const handlerName = (name: string): string =>
     .join('') + 'Command';
 
 describe('command table (spec 7.9)', () => {
-  it('has every command built so far (steps 5 to 11)', () => {
+  it('has every command built so far (steps 5 to 17)', () => {
     const names = [...buildCommandTable().keys()].sort();
     expect(names).toEqual(
       [
@@ -73,7 +73,11 @@ describe('command table (spec 7.9)', () => {
         'pexpire',
         'pexpireat',
         'ping',
+        'psubscribe',
         'pttl',
+        'publish',
+        'pubsub',
+        'punsubscribe',
         'quit',
         'randomkey',
         'rename',
@@ -96,12 +100,14 @@ describe('command table (spec 7.9)', () => {
         'srem',
         'sscan',
         'strlen',
+        'subscribe',
         'sunion',
         'sunionstore',
         'time',
         'ttl',
         'type',
         'unlink',
+        'unsubscribe',
         'unwatch',
         'watch',
         'zadd',

@@ -18,10 +18,12 @@
 import {
   ERR,
   ReplyError,
+  subscriberContext,
   unknownCommand,
   unknownSubcommand,
   wrongArity,
 } from '../protocol/errors.js';
+import { inSubscriberMode } from '../pubsub/hub.js';
 import type { Client } from '../server/client.js';
 import type { Server } from '../server/server.js';
 import { unwatchAllKeys } from '../storage/watch.js';
@@ -29,6 +31,16 @@ import { CommandContext, arityOk, lookupSubcommand } from './command.js';
 import type { CommandSpec } from './command.js';
 
 /** The commands that run at once inside MULTI instead of being queued (spec 9.1 step 5). */
+/** What a RESP2 client with subscriptions may run (spec 9.11); RESET joins in step 22. */
+const SUBSCRIBER_COMMANDS = new Set([
+  'subscribe',
+  'psubscribe',
+  'unsubscribe',
+  'punsubscribe',
+  'ping',
+  'quit',
+]);
+
 const RUN_INSIDE_MULTI = new Set(['exec', 'discard', 'multi', 'watch', 'quit']);
 
 export function dispatch(server: Server, client: Client, argv: readonly string[]): void {
@@ -56,7 +68,12 @@ export function dispatch(server: Server, client: Client, argv: readonly string[]
       return;
     }
   }
-  // 3–4 join in later steps, in this order: NOAUTH (22), RESP2 subscriber mode (17).
+  // 3 joins in step 22: NOAUTH.
+  // 4. RESP2 subscriber mode: only the subscription commands, PING and QUIT.
+  if (inSubscriberMode(client) && !SUBSCRIBER_COMMANDS.has(top.name)) {
+    reject(client, spec, subscriberContext(spec.name));
+    return;
+  }
   // 5. MULTI: refuse what can't run in a transaction, queue everything else.
   if (client.multi && spec.flags.includes('nomulti')) {
     reject(client, spec, ERR.NOT_ALLOWED_IN_MULTI);

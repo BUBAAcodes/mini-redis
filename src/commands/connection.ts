@@ -11,14 +11,17 @@
  */
 import { ERR, ReplyError, wrongArity } from '../protocol/errors.js';
 import { parseInt64 } from '../utils/numbers.js';
+import { inSubscriberMode } from '../pubsub/hub.js';
 import { command, containerOnly } from './command.js';
 import type { CommandContext, CommandSpec } from './command.js';
 
 export function pingCommand(ctx: CommandContext): void {
-  // Arity is -1 so that subscriber mode (step 17) can accept PING; more than one arg is still
-  // an arity error.
+  // Arity is -1 so that subscriber mode can accept PING; more than one arg is still an arity
+  // error.
   if (ctx.argv.length > 2) throw new ReplyError(wrongArity('ping'));
-  if (ctx.argv.length === 1) ctx.reply.simple('PONG');
+  // A RESP2 subscriber can't tell a +PONG from a message, so it gets an array (spec 9.11).
+  if (inSubscriberMode(ctx.client)) ctx.reply.array(['pong', ctx.argv[1] ?? '']);
+  else if (ctx.argv.length === 1) ctx.reply.simple('PONG');
   else ctx.reply.bulk(ctx.argv[1]!);
 }
 

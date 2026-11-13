@@ -62,8 +62,8 @@ export class CommandContext {
   }
 
   /** Propagate `argv` in this db; the command as it arrived is then not propagated. */
-  alsoPropagate(argv: readonly string[]): void {
-    this.server.propagator.alsoPropagate(this.db.id, argv);
+  alsoPropagate(argv: readonly string[], replicasOnly = false): void {
+    this.server.propagator.alsoPropagate(this.db.id, argv, replicasOnly);
   }
 
   preventPropagation(): void {

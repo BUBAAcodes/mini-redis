@@ -43,6 +43,19 @@ describe('Propagator (spec 9.5)', () => {
     expect(records).toEqual([{ db: 1, argv: ['SREM', 's', 'a', 'b'] }]);
   });
 
+  it('marks a replicas-only record, and only that one', () => {
+    const { p, records } = setup();
+    p.begin();
+    p.alsoPropagate(0, ['PUBLISH', 'c', 'm'], true);
+    p.end(0, ['PUBLISH', 'c', 'm'], false);
+    p.begin();
+    p.end(0, ['SET', 'k', 'v'], true);
+    expect(records).toEqual([
+      { db: 0, argv: ['PUBLISH', 'c', 'm'], replicasOnly: true },
+      { db: 0, argv: ['SET', 'k', 'v'] },
+    ]);
+  });
+
   it('preventPropagation drops the record', () => {
     const { p, records } = setup();
     p.begin();
