@@ -10,6 +10,7 @@
  */
 import type { CommandTable } from './command.js';
 import { connectionCommands } from './connection.js';
+import { debugCommands } from './debug.js';
 import { keyCommands } from './keys.js';
 import { serverCommands } from './server.js';
 import { stringCommands } from './strings.js';
@@ -21,6 +22,7 @@ export function buildCommandTable(): CommandTable {
     ...stringCommands,
     ...keyCommands,
     ...serverCommands,
+    ...debugCommands,
   ]) {
     if (table.has(spec.name)) throw new Error(`duplicate command '${spec.name}'`);
     table.set(spec.name, spec);

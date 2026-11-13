@@ -10,6 +10,7 @@ import {
   subscriberContext,
   unknownCommand,
   unknownSubcommand,
+  unsupportedOption,
   wrongArity,
 } from '../../src/protocol/errors.js';
 
@@ -46,6 +47,10 @@ describe('error strings (spec 7.4, checked against redis:7.4)', () => {
       OFFSET_OUT_OF_RANGE: 'ERR offset is out of range',
       STRING_TOO_LONG: 'ERR string exceeds maximum allowed size (proto-max-bulk-len)',
       BGSAVE_IN_PROGRESS: 'ERR Background save already in progress',
+      EXPIRE_NX_CONFLICT: 'ERR NX and XX, GT or LT options at the same time are not compatible',
+      EXPIRE_GT_LT_CONFLICT: 'ERR GT and LT options at the same time are not compatible',
+      DEBUG_NOT_ALLOWED:
+        'ERR DEBUG command not allowed. If the enable-debug-command option is set to "local", you can run it from a local connection, otherwise you need to set this option in the configuration file, and then restart the server.',
       INTERNAL: 'ERR internal error',
     });
   });
@@ -103,6 +108,8 @@ describe('error strings (spec 7.4, checked against redis:7.4)', () => {
       `ERR unknown subcommand '${'x'.repeat(128)}'. Try CLIENT HELP.`,
     );
     expect(invalidExpireTime('set')).toBe("ERR invalid expire time in 'set' command");
+    expect(unsupportedOption('Bogus')).toBe('ERR Unsupported option Bogus');
+    expect(unsupportedOption('a\0b')).toBe('ERR Unsupported option a');
     expect(subscriberContext('get')).toBe(
       "ERR Can't execute 'get': only (P|S)SUBSCRIBE / (P|S)UNSUBSCRIBE / PING / QUIT / RESET are allowed in this context",
     );

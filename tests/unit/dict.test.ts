@@ -315,6 +315,21 @@ describe('Dict sampling', () => {
     }
   });
 
+  it('randomEntries(n) still finds entries when a grow has just started', () => {
+    // Right after a grow starts, the upper half of the new table is empty and has no old
+    // buckets behind it. A walk that starts there must jump elsewhere instead of giving up
+    // empty-handed, as Redis's dictGetSomeKeys does; active expiry stopped early without it.
+    const d = newDict<number>();
+    for (let i = 0; !d.isRehashing || i < 4000; i++) d.set(`k${i}`, i);
+    expect(d.isRehashing).toBe(true);
+    for (let round = 0; round < 2000; round++) {
+      const sample = d.randomEntries(20);
+      expect(sample.length).toBeGreaterThan(0);
+      expect(new Set(sample.map(([k]) => k)).size).toBe(sample.length);
+      for (const [k, v] of sample) expect(d.get(k)).toBe(v);
+    }
+  });
+
   it('randomEntries(n) never returns more than the dict holds', () => {
     const d = filled(3);
     expect(d.randomEntries(10).length).toBe(3);

@@ -51,6 +51,11 @@ export const ERR = {
   OFFSET_OUT_OF_RANGE: 'ERR offset is out of range',
   STRING_TOO_LONG: 'ERR string exceeds maximum allowed size (proto-max-bulk-len)',
   BGSAVE_IN_PROGRESS: 'ERR Background save already in progress',
+  EXPIRE_NX_CONFLICT: 'ERR NX and XX, GT or LT options at the same time are not compatible',
+  EXPIRE_GT_LT_CONFLICT: 'ERR GT and LT options at the same time are not compatible',
+  // Redis's text, "local" mode included, though we only have yes and no.
+  DEBUG_NOT_ALLOWED:
+    'ERR DEBUG command not allowed. If the enable-debug-command option is set to "local", you can run it from a local connection, otherwise you need to set this option in the configuration file, and then restart the server.',
   INTERNAL: 'ERR internal error',
 } as const;
 
@@ -95,6 +100,10 @@ export const unknownSubcommand = (sub: string, command: string): string =>
 
 export const invalidExpireTime = (command: string): string =>
   `ERR invalid expire time in '${command}' command`;
+
+/** EXPIRE's unknown-flag error, the option as the client typed it. */
+export const unsupportedOption = (option: string): string =>
+  `ERR Unsupported option ${cString(option)}`;
 
 export const subscriberContext = (command: string): string =>
   `ERR Can't execute '${command}': only (P|S)SUBSCRIBE / (P|S)UNSUBSCRIBE / PING / QUIT / RESET are allowed in this context`;

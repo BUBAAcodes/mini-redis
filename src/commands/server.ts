@@ -1,6 +1,7 @@
 /**
  * Server commands for step 5: COMMAND (COUNT, INFO), CONFIG (GET, SET, RESETSTAT, HELP), TIME
- * and INFO. SAVE, BGSAVE, SHUTDOWN, DEBUG, SLOWLOG, MONITOR, MEMORY and OBJECT come later.
+ * and INFO. SAVE, BGSAVE, SHUTDOWN, SLOWLOG, MONITOR, MEMORY and OBJECT come later; DEBUG
+ * lives in debug.ts.
  *
  * Key design choice: COMMAND INFO is generated from the command table, so it can never
  * disagree with what the dispatcher enforces. COMMAND DOCS is deliberately not a subcommand:

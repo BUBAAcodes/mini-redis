@@ -1,5 +1,5 @@
 // Starts a MiniRedis server in this process on port 0 with a fresh temp dir, and captures its
-// log lines instead of printing them.
+// log lines instead of printing them. DEBUG is on, as spec 5 says tests run it.
 import { mkdtemp, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -21,11 +21,13 @@ export async function startServer(
 ): Promise<TestServer> {
   const dir = await mkdtemp(join(tmpdir(), 'miniredis-test-'));
   const config = Config.fromDirectives(
-    Object.entries({ port: '0', dir, ...directives }).map(([name, value]) => ({
-      args: [name, value],
-      where: 'in a test',
-      line: `${name} ${value}`,
-    })),
+    Object.entries({ port: '0', dir, 'enable-debug-command': 'yes', ...directives }).map(
+      ([name, value]) => ({
+        args: [name, value],
+        where: 'in a test',
+        line: `${name} ${value}`,
+      }),
+    ),
   );
   const logs: string[] = [];
   const server = new Server({ config, log: (line) => logs.push(line), seed });

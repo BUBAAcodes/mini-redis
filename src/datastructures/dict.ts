@@ -298,6 +298,9 @@ export class Dict<V> {
   /**
    * Up to n distinct entries from consecutive buckets after a random start: cheap sampling for
    * eviction and active expiry. Stops after visiting n × 10 buckets, so it may return fewer.
+   * After a run of empty buckets it jumps to a new random one, as Redis does: right after a
+   * grow starts, the upper half of t1 is empty with no t0 buckets behind it, and a walk that
+   * starts there would otherwise use up its steps and return nothing.
    */
   randomEntries(n: number): Array<[string, V]> {
     const count = Math.min(n, this.size);
@@ -306,6 +309,10 @@ export class Dict<V> {
     const t1 = this.t1;
     const maxMask = Math.max(this.t0.length, t1?.length ?? 0) - 1;
     let i = this.rng.uint32() & maxMask;
+    let emptyRun = 0;
+    // Buckets already taken from. A jump or a wrap-around can land on one again, and skipping
+    // it keeps the entries distinct. At most `count` long, so a linear search is cheapest.
+    const used: number[] = [];
     for (let steps = count * 10; steps > 0; steps--) {
       let skipT0 = false;
       if (t1 && i < this.rehashIdx) {
@@ -313,6 +320,11 @@ export class Dict<V> {
         if (i >= t1.length) i = this.rehashIdx;
         else skipT0 = true;
       }
+      if (used.includes(i)) {
+        i = (i + 1) & maxMask;
+        continue;
+      }
+      const before = out.length;
       if (!skipT0 && i < this.t0.length) {
         for (let e = this.t0[i]; e; e = e.next) {
           out.push([e.key, e.value]);
@@ -324,6 +336,15 @@ export class Dict<V> {
           out.push([e.key, e.value]);
           if (out.length === count) return out;
         }
+      }
+      if (out.length > before) {
+        used.push(i);
+        emptyRun = 0;
+      } else if (++emptyRun >= 5 && emptyRun > count) {
+        // dictGetSomeKeys's rule: too many empty buckets in a row, so try somewhere else.
+        i = this.rng.uint32() & maxMask;
+        emptyRun = 0;
+        continue;
       }
       i = (i + 1) & maxMask;
     }

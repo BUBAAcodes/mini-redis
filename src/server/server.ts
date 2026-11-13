@@ -87,6 +87,10 @@ export class Server {
   cmdTime = Date.now();
   /** The port actually listened on: differs from the config when it's 0 (tests). */
   port = 0;
+  /** Off after DEBUG SET-ACTIVE-EXPIRE 0: expired keys then go only when touched. */
+  activeExpireEnabled = true;
+  /** The db the next active-expiry cycle starts at (spec 9.3: resume where it stopped). */
+  activeExpireDb = 0;
 
   private nextClientId = 1;
   private listener: net.Server | null = null;
