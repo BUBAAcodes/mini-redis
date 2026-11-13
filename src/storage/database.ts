@@ -2,7 +2,7 @@
  * Db: one numbered database and the only door to its keys (spec 6.1, rule 5).
  *
  * Key design choice: commands never see the dicts. Every read and change goes through a
- * method here, so lazy expiry, WATCH (16), blocked-key wakeups (18), memory accounting (19),
+ * method here, so lazy expiry, WATCH, blocked-key wakeups (18), memory accounting (19),
  * the copy-on-write snapshot hook (13) and the dirty counter all hang off a handful of places
  * instead of every command. Each later step fills in its hook where the comments say.
  *
@@ -14,11 +14,14 @@
  *
  * Mirrors Redis db.c (lookupKeyRead, lookupKeyWrite, dbAdd, setKey, dbDelete,
  * signalModifiedKey, expireIfNeeded, deleteExpiredKeyAndPropagate, setExpire, removeExpire,
- * getExpire).
+ * getExpire, keyIsExpired).
  */
 import { Dict } from '../datastructures/dict.js';
+import type { Client } from '../server/client.js';
 import type { Server } from '../server/server.js';
 import type { RObj } from './redis-object.js';
+import { touchAllWatchedKeysInDb, touchWatchedKey } from './watch.js';
+import type { WatchedKey } from './watch.js';
 
 export interface SetKeyOptions {
   /** Keep the key's TTL instead of dropping it (SET … KEEPTTL). */
@@ -30,6 +33,8 @@ export class Db {
   readonly dict: Dict<RObj>;
   /** key → expiry in Unix ms. */
   readonly expires: Dict<number>;
+  /** WATCH registry: key → its watchers, each with its entry (storage/watch.ts). */
+  readonly watched = new Map<string, Map<Client, WatchedKey>>();
 
   constructor(
     readonly id: number,
@@ -104,9 +109,11 @@ export class Db {
 
   /**
    * Empties the db and returns how many keys it held, which all count as changes for save
-   * points. The WATCH hook (step 16) and the snapshot hook (step 13) go here.
+   * points. Watchers are touched first, while the keys they watch can still be seen. The
+   * snapshot hook (step 13) goes here.
    */
   flush(): number {
+    touchAllWatchedKeysInDb(this);
     const removed = this.dict.size;
     this.dict.clear();
     this.expires.clear();
@@ -168,6 +175,17 @@ export class Db {
     return this.expires.get(key) ?? -1;
   }
 
+  /** Past its deadline at `cmdTime`, whether or not it has been deleted yet. Never deletes. */
+  isExpired(key: string): boolean {
+    const expireAt = this.expires.get(key);
+    return expireAt !== undefined && this.server.cmdTime > expireAt;
+  }
+
+  /** Stored right now, expired or not: WATCH bookkeeping only. Commands use the lookups. */
+  hasEntry(key: string): boolean {
+    return this.dict.has(key);
+  }
+
   /**
    * Deletes the key if its deadline has passed (`cmdTime > deadline`, as in Redis's
    * keyIsExpired) and returns whether it did. Lookups call it; so do SCAN and RANDOMKEY.
@@ -205,21 +223,23 @@ export class Db {
 
   /**
    * Lazy and active expiry share this: delete, count, and propagate `DEL key` now, ahead of the
-   * running command's record. No dirty++ (see the header). WATCH (step 16) joins here.
+   * running command's record. No dirty++ (see the header), but watchers see the deletion.
    */
   private deleteExpired(key: string): void {
     this.dict.delete(key);
     this.expires.delete(key);
     this.server.stats.expiredKeys++;
     this.server.propagator.propagateNow(this.id, ['DEL', key]);
+    touchWatchedKey(this, key);
   }
 
   /**
-   * Called exactly once after a command changes a key. WATCH (step 16), blocked clients (18)
-   * and memory accounting (19) join here; for now it counts the change for save points and
-   * propagation.
+   * Called exactly once after a command changes a key: fails the EXEC of every client watching
+   * it and counts the change for save points and propagation. Blocked clients (18) and memory
+   * accounting (19) join here.
    */
-  signalModifiedKey(_key: string): void {
+  signalModifiedKey(key: string): void {
+    touchWatchedKey(this, key);
     this.server.dirty++;
   }
 

@@ -12,7 +12,7 @@ import { buildCommandTable } from '../../src/commands/registry.js';
 import { Random } from '../../src/utils/random.js';
 import { TestClient, type Exchange } from '../helpers/resp-client.js';
 import { startServer, type TestServer } from '../helpers/server.js';
-import { repliesMatch } from './compare.js';
+import { execRepliesMatch, repliesMatch } from './compare.js';
 import { DB_COUNT, Generator } from './generator.js';
 
 const SEED = process.env.SEED ? Number(process.env.SEED) >>> 0 : Random.entropySeed();
@@ -55,6 +55,7 @@ describe('differential: MiniRedis against Redis 7.4', () => {
     const registered = new Set(buildCommandTable().keys());
     const gen = new Generator(SEED, registered);
     const commands = Array.from({ length: OPS }, () => gen.next());
+    commands.push(...gen.drain());
     const hash = createHash('sha1')
       .update(Buffer.from(JSON.stringify(commands), 'latin1'))
       .digest('hex');
@@ -62,14 +63,24 @@ describe('differential: MiniRedis against Redis 7.4', () => {
     process.stderr.write(`SEED=${SEED} OPS=${OPS} commands-sha1=${hash}\n`);
 
     const history: string[] = [];
+    // The commands Redis queued since MULTI, so EXEC's reply can be compared element by element.
+    let queued: string[][] | null = null;
     for (const [i, argv] of commands.entries()) {
       const r: Exchange = await ref.exchange(...argv);
       const m: Exchange = await mine.exchange(...argv);
+      const name = argv[0]!.toLowerCase();
       history.push(
         `${argv.map(show).join(' ')}\n      redis:     ${show(r.raw)}\n      miniredis: ${show(m.raw)}`,
       );
       if (history.length > HISTORY) history.shift();
-      if (!repliesMatch(argv, r, m)) {
+      const match =
+        name === 'exec' && queued !== null
+          ? execRepliesMatch(queued, r, m)
+          : repliesMatch(argv, r, m);
+      if (name === 'multi' && queued === null && r.raw === '+OK\r\n') queued = [];
+      else if (name === 'exec' || name === 'discard') queued = null;
+      else if (queued !== null && r.raw === '+QUEUED\r\n') queued.push(argv);
+      if (!match) {
         throw new Error(
           `replies differ (SEED=${SEED}, command ${i + 1} of ${OPS})\n` +
             `Last ${history.length} commands:\n  ${history.join('\n  ')}`,

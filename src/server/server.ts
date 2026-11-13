@@ -21,6 +21,7 @@ import { Config } from '../config.js';
 import type { DictOptions } from '../datastructures/dict.js';
 import { ProtocolError } from '../protocol/errors.js';
 import { Db } from '../storage/database.js';
+import { unwatchAllKeys } from '../storage/watch.js';
 import { Logger } from '../utils/logger.js';
 import { Random } from '../utils/random.js';
 import { Client } from './client.js';
@@ -237,5 +238,7 @@ export class Server {
     client.closed = true;
     this.clients.delete(client.id);
     this.eventLoop.forget(client);
+    // A gone client must not stay in any db's WATCH registry.
+    unwatchAllKeys(client);
   }
 }

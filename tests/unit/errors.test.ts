@@ -67,6 +67,7 @@ describe('error strings (spec 7.4, checked against redis:7.4)', () => {
       DEBUG_NOT_ALLOWED:
         'ERR DEBUG command not allowed. If the enable-debug-command option is set to "local", you can run it from a local connection, otherwise you need to set this option in the configuration file, and then restart the server.',
       INTERNAL: 'ERR internal error',
+      NOT_ALLOWED_IN_MULTI: 'ERR Command not allowed inside a transaction',
     });
   });
 

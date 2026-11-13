@@ -10,6 +10,12 @@
  * from Redis, where the handler must also call preventCommandPropagation(). Each sink adds
  * SELECT itself when a record's db differs from the last one it wrote.
  *
+ * During EXEC (multiStart … multiEnd) records are held back and then sent as `MULTI`, the
+ * records, `EXEC`, so a replay applies the transaction atomically. Lazy-expiry DELs found
+ * inside EXEC go inside too. MULTI takes the first record's db and EXEC the last one's, so no
+ * sink needs a SELECT just for them. Spec 9.5 wraps every EXEC that wrote anything; Redis 7
+ * skips the wrapper when there is only one record (docs/DIFFERENCES.md).
+ *
  * Mirrors Redis server.c (call, alsoPropagate, propagatePendingCommands,
  * preventCommandPropagation).
  */
@@ -28,6 +34,8 @@ export class Propagator {
   private also: PropagationRecord[] = [];
   private rewritten: readonly string[] | null = null;
   private prevented = false;
+  /** Records held back while an EXEC runs; null outside one. */
+  private transaction: PropagationRecord[] | null = null;
 
   /** `wake` runs whenever a record goes out, so beforeSleep writes it this loop turn. */
   constructor(private readonly wake: () => void) {}
@@ -78,8 +86,27 @@ export class Propagator {
     this.begin();
   }
 
+  /** EXEC is about to run its queue: hold its records back. */
+  multiStart(): void {
+    this.transaction = [];
+  }
+
+  /** EXEC finished: send what it wrote, wrapped in MULTI … EXEC, or nothing if it wrote nothing. */
+  multiEnd(): void {
+    const records = this.transaction;
+    this.transaction = null;
+    if (records === null || records.length === 0) return;
+    this.emit({ db: records[0]!.db, argv: ['MULTI'] });
+    for (const record of records) this.emit(record);
+    this.emit({ db: records[records.length - 1]!.db, argv: ['EXEC'] });
+  }
+
   private emit(record: PropagationRecord): void {
     if (this.sinks.size === 0) return;
+    if (this.transaction !== null) {
+      this.transaction.push(record);
+      return;
+    }
     for (const sink of this.sinks) sink.append(record);
     this.wake();
   }

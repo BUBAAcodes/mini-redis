@@ -69,6 +69,46 @@ describe('Propagator (spec 9.5)', () => {
     expect(records).toEqual([{ db: 0, argv: ['SET', 'b', '2'] }]);
   });
 
+  it('wraps the records of an EXEC in MULTI … EXEC, in the dbs they ran in', () => {
+    const { p, records } = setup();
+    p.multiStart();
+    p.begin();
+    p.end(2, ['SET', 'a', '1'], true);
+    p.begin();
+    p.propagateNow(2, ['DEL', 'expired']);
+    p.end(2, ['GET', 'expired'], false);
+    p.begin();
+    p.end(5, ['INCR', 'b'], true);
+    expect(records).toEqual([]);
+    p.multiEnd();
+    expect(records).toEqual([
+      { db: 2, argv: ['MULTI'] },
+      { db: 2, argv: ['SET', 'a', '1'] },
+      { db: 2, argv: ['DEL', 'expired'] },
+      { db: 5, argv: ['INCR', 'b'] },
+      { db: 5, argv: ['EXEC'] },
+    ]);
+  });
+
+  it('emits nothing for an EXEC that wrote nothing', () => {
+    const { p, records, wakes } = setup();
+    p.multiStart();
+    p.begin();
+    p.end(0, ['GET', 'a'], false);
+    p.multiEnd();
+    expect(records).toEqual([]);
+    expect(wakes()).toBe(0);
+  });
+
+  it('wraps even a single write, as spec 9.5 says', () => {
+    const { p, records } = setup();
+    p.multiStart();
+    p.begin();
+    p.end(0, ['SET', 'a', '1'], true);
+    p.multiEnd();
+    expect(records.map((r) => r.argv[0])).toEqual(['MULTI', 'SET', 'EXEC']);
+  });
+
   it('stops sending to a detached sink', () => {
     const { p, records, detach } = setup();
     detach();

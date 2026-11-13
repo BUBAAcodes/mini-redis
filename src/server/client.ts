@@ -5,16 +5,24 @@
  * Key design choice: the output queue is the client's `Reply`. Handlers append to it, and only
  * beforeSleep turns it into socket writes, once per event-loop turn. So a pipeline of a
  * thousand commands that arrived in one chunk leaves in one write, and replies stay in the
- * order the commands came in (rule 12). Later steps add the MULTI, pub/sub, blocking, monitor
- * and replica fields here.
+ * order the commands came in (rule 12). Later steps add the pub/sub, blocking, monitor and
+ * replica fields here.
  *
  * Mirrors Redis networking.c (createClient, freeClient) and the client struct in server.h.
  */
 import type { Socket } from 'node:net';
+import type { CommandSpec } from '../commands/command.js';
 import { Reply } from '../protocol/encoder.js';
 import type { RespVersion } from '../protocol/encoder.js';
 import { RespParser } from '../protocol/parser.js';
 import type { ParserLimits } from '../protocol/parser.js';
+import type { WatchedKey } from '../storage/watch.js';
+
+/** A command waiting for EXEC: already looked up and checked, so EXEC only has to run it. */
+export interface QueuedCommand {
+  readonly spec: CommandSpec;
+  readonly argv: readonly string[];
+}
 
 export class Client {
   readonly addr: string;
@@ -38,6 +46,16 @@ export class Client {
   lastInteraction = this.createdAt;
   /** Full name of the last command run, e.g. 'client|setname', for CLIENT LIST. */
   lastCommand = '';
+
+  /** Between MULTI and EXEC or DISCARD (and while EXEC runs the queue, as in Redis). */
+  multi = false;
+  /** A watched key changed: EXEC must reply with a null array. */
+  dirtyCas = false;
+  /** A command failed its checks while queueing: EXEC must reply with EXECABORT. */
+  dirtyExec = false;
+  queued: QueuedCommand[] = [];
+  /** This client's WATCH entries; the other half of the registry is in each Db. */
+  watchedKeys: WatchedKey[] = [];
 
   constructor(
     readonly id: number,

@@ -8,7 +8,12 @@
  * is a bug: it's logged with its stack and answered with -ERR internal error, and the server
  * keeps serving everyone else.
  *
- * Mirrors Redis server.c (processCommand, call).
+ * Inside MULTI, a command that fails a check gets its error and flags the transaction, so EXEC
+ * will abort; one that passes is queued and runs later through call(), the same path as a
+ * normal command, so stats and propagation can't differ between the two.
+ *
+ * Mirrors Redis server.c (processCommand, rejectCommand, call) and multi.c (queueMultiCommand,
+ * flagTransaction, discardTransaction, execCommandAbort).
  */
 import {
   ERR,
@@ -19,48 +24,98 @@ import {
 } from '../protocol/errors.js';
 import type { Client } from '../server/client.js';
 import type { Server } from '../server/server.js';
+import { unwatchAllKeys } from '../storage/watch.js';
 import { CommandContext, arityOk, lookupSubcommand } from './command.js';
 import type { CommandSpec } from './command.js';
 
+/** The commands that run at once inside MULTI instead of being queued (spec 9.1 step 5). */
+const RUN_INSIDE_MULTI = new Set(['exec', 'discard', 'multi', 'watch', 'quit']);
+
 export function dispatch(server: Server, client: Client, argv: readonly string[]): void {
-  const reply = client.reply;
-  // 1. Look up the command, then its subcommand. (Inside MULTI, step 16 also flags the
-  //    transaction on these errors.)
-  let spec = server.commands.get(argv[0]!.toLowerCase());
-  if (spec === undefined) {
-    reply.error(unknownCommand(argv));
+  // 1. Look up the command, then its subcommand.
+  const top = server.commands.get(argv[0]!.toLowerCase());
+  if (top === undefined) {
+    reject(client, null, unknownCommand(argv));
     return;
   }
   // 2. Arity, of the container first and then of the subcommand, as Redis checks them.
-  if (!arityOk(spec.arity, argv.length)) {
-    reply.error(wrongArity(spec.name));
+  if (!arityOk(top.arity, argv.length)) {
+    reject(client, top, wrongArity(top.name));
     return;
   }
-  if (spec.subcommands && argv.length >= 2) {
-    const sub = lookupSubcommand(spec, argv[1]!);
+  let spec = top;
+  if (top.subcommands && argv.length >= 2) {
+    const sub = lookupSubcommand(top, argv[1]!);
     if (sub === undefined) {
-      reply.error(unknownSubcommand(argv[1]!, spec.name));
+      reject(client, top, unknownSubcommand(argv[1]!, top.name));
       return;
     }
     spec = sub;
     if (!arityOk(spec.arity, argv.length)) {
-      reply.error(wrongArity(spec.name));
+      reject(client, spec, wrongArity(spec.name));
       return;
     }
   }
-  // 3–7 join in later steps, in this order: NOAUTH (22), RESP2 subscriber mode (17), MULTI
-  // queueing (16), -READONLY on a replica (21), eviction and -OOM for denyoom commands (19).
+  // 3–4 join in later steps, in this order: NOAUTH (22), RESP2 subscriber mode (17).
+  // 5. MULTI: refuse what can't run in a transaction, queue everything else.
+  if (client.multi && spec.flags.includes('nomulti')) {
+    reject(client, spec, ERR.NOT_ALLOWED_IN_MULTI);
+    return;
+  }
+  // 6–7 join here: -READONLY on a replica (21), eviction and -OOM for denyoom commands (19).
+  if (client.multi && !RUN_INSIDE_MULTI.has(top.name)) {
+    client.queued.push({ spec, argv });
+    client.reply.simple('QUEUED');
+    return;
+  }
   call(server, client, spec, argv);
 }
 
+/**
+ * A command that failed a check before running. Inside MULTI it also dooms the transaction.
+ * EXEC itself failing a check (only its arity can) ends the transaction at once with the
+ * reason, in or out of MULTI, as Redis's execCommandAbort does.
+ */
+function reject(client: Client, spec: CommandSpec | null, message: string): void {
+  if (spec?.name === 'exec') {
+    discardTransaction(client);
+    const reason = message.startsWith('ERR ') ? message.slice(4) : message;
+    client.reply.error(`EXECABORT Transaction discarded because of: ${reason}`);
+    return;
+  }
+  if (client.multi) client.dirtyExec = true;
+  client.reply.error(message);
+}
+
+/** Leaves MULTI (or makes sure it's left): drops the queue, both dirty flags and every WATCH. */
+export function discardTransaction(client: Client): void {
+  client.multi = false;
+  client.dirtyCas = false;
+  client.dirtyExec = false;
+  client.queued = [];
+  unwatchAllKeys(client);
+}
+
+export interface CallOptions {
+  /** Run by EXEC: the clock was read once for the whole transaction (spec 7.5). */
+  inExec?: boolean;
+}
+
 /** Steps 8–11 of spec 9.1: run the handler, record stats, propagate. */
-function call(server: Server, client: Client, spec: CommandSpec, argv: readonly string[]): void {
+export function call(
+  server: Server,
+  client: Client,
+  spec: CommandSpec,
+  argv: readonly string[],
+  options: CallOptions = {},
+): void {
+  // The db is read per command: a queued SELECT moves the commands after it.
   const db = server.dbs[client.db]!;
   const ctx = new CommandContext(server, client, db, argv);
   const dirtyBefore = server.dirty;
   server.propagator.begin();
   // Read the clock once, so a key can't expire halfway through a command (spec 7.5).
-  server.cmdTime = Date.now();
+  if (!options.inExec) server.cmdTime = Date.now();
   const start = process.hrtime.bigint();
   try {
     spec.handler(ctx);
@@ -83,5 +138,6 @@ function call(server: Server, client: Client, spec: CommandSpec, argv: readonly 
   // 10. Propagate: the command's own record only if it's a write that changed something.
   const changed = server.dirty > dirtyBefore && spec.flags.includes('write');
   server.propagator.end(db.id, argv, changed);
-  // 11. Serving blocked clients whose keys became ready (step 18) goes here.
+  // 11. Serving blocked clients whose keys became ready (step 18) goes here, after the whole
+  //     EXEC rather than after each of its commands.
 }

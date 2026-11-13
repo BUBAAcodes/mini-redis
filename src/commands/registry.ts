@@ -17,6 +17,7 @@ import { listCommands } from './lists.js';
 import { serverCommands } from './server.js';
 import { setCommands } from './sets.js';
 import { stringCommands } from './strings.js';
+import { transactionCommands } from './transactions.js';
 import { zsetCommands } from './zsets.js';
 
 export function buildCommandTable(): CommandTable {
@@ -29,6 +30,7 @@ export function buildCommandTable(): CommandTable {
     ...hashCommands,
     ...setCommands,
     ...zsetCommands,
+    ...transactionCommands,
     ...serverCommands,
     ...debugCommands,
   ]) {

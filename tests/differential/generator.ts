@@ -5,6 +5,10 @@
 // of later steps (lists, hashes, ...) join the harness by appearing in the table, with a new
 // entry in TEMPLATES below.
 //
+// Short WATCH/MULTI … EXEC blocks are mixed in (spec 15.3) once MULTI is registered: the commands
+// inside are ordinary draws, so queue-time errors (EXECABORT), run-time errors (no rollback) and
+// a change between WATCH and EXEC (a null EXEC) are all compared.
+//
 // Never generated, because they have their own tests (spec 15.3): random commands, SCAN cursors,
 // OBJECT, MEMORY, INFO, DEBUG, CONFIG, CLIENT, blocking commands, pub/sub, persistence and
 // replication commands. TTLs are at least 100 seconds, so nothing expires mid-run.
@@ -365,10 +369,14 @@ export class Generator {
   private readonly weights: number[];
   private readonly total: number;
   private readonly g: Gen;
+  private readonly transactions: boolean;
+  /** The rest of a transaction block that next() has started handing out. */
+  private pending: string[][] = [];
 
   /** `registered` is the set of command names MiniRedis knows. */
   constructor(seed: number, registered: ReadonlySet<string>) {
     this.g = new Gen(new Random(seed));
+    this.transactions = ['multi', 'exec', 'discard', 'watch'].every((n) => registered.has(n));
     this.names = Object.keys(TEMPLATES).filter((n) => registered.has(n));
     this.weights = this.names.map((n) => TEMPLATES[n]![0]);
     this.total = this.weights.reduce((a, b) => a + b, 0);
@@ -377,6 +385,46 @@ export class Generator {
 
   /** The next command. SELECT is mixed in so keys land in all databases. */
   next(): string[] {
+    const queued = this.pending.shift();
+    if (queued !== undefined) return queued;
+    if (this.transactions && this.g.chance(3)) {
+      this.pending = this.transactionBlock();
+      return this.pending.shift()!;
+    }
+    return this.single();
+  }
+
+  /** What's left of an unfinished block, so a run never ends inside MULTI. */
+  drain(): string[][] {
+    const rest = this.pending;
+    this.pending = [];
+    return rest;
+  }
+
+  /**
+   * [WATCH keys [a command that may touch them]] MULTI, 1–4 commands, then EXEC (or DISCARD, or
+   * a broken EXEC that aborts at once). Now and then a nested MULTI or a WATCH inside, which
+   * are errors that don't abort the transaction.
+   */
+  private transactionBlock(): string[][] {
+    const g = this.g;
+    const block: string[][] = [];
+    if (g.chance(40)) {
+      block.push(['WATCH', g.key(), ...(g.chance(50) ? [g.key()] : [])]);
+      if (g.chance(50)) block.push(this.single());
+    }
+    block.push(['MULTI']);
+    const n = 1 + g.rnd.int(4);
+    for (let i = 0; i < n; i++) {
+      if (g.chance(5)) block.push(g.pick([['MULTI'], ['WATCH', g.key()]]));
+      block.push(this.single());
+    }
+    const r = g.rnd.int(100);
+    block.push(r < 85 ? ['EXEC'] : r < 95 ? ['DISCARD'] : ['EXEC', 'x']);
+    return block;
+  }
+
+  private single(): string[] {
     const g = this.g;
     if (g.chance(4)) return ['SELECT', String(g.rnd.int(DB_COUNT))];
     let r = g.rnd.next() * this.total;

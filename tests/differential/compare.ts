@@ -4,7 +4,8 @@
 // the spec allows: unordered replies (KEYS, until sets and hashes arrive) are compared as sorted
 // lists, and positive TTL/PTTL values may differ by up to 1 s / 100 ms because the two servers
 // read their clocks at different moments. Anything else that differs gets fixed in MiniRedis,
-// not here (the rule in 15.3).
+// not here (the rule in 15.3). An EXEC reply is compared element by element, each against the
+// command that was queued for it, so the same two exceptions apply inside transactions.
 import type { Exchange, RespValue } from '../helpers/resp-client.js';
 
 /** Replies whose element order is unspecified, so they are compared as sorted lists. */
@@ -49,4 +50,24 @@ export function repliesMatch(argv: readonly string[], ref: Exchange, mine: Excha
     return a !== null && b !== null && a.length === b.length && a.every((x, i) => x === b[i]);
   }
   return false;
+}
+
+/**
+ * EXEC's reply: `queued` are the commands that were answered +QUEUED, in order. A null array,
+ * EXECABORT or any other non-array must match exactly.
+ */
+export function execRepliesMatch(
+  queued: readonly (readonly string[])[],
+  ref: Exchange,
+  mine: Exchange,
+): boolean {
+  if (ref.raw === mine.raw) return true;
+  const a = ref.value;
+  const b = mine.value;
+  if (!Array.isArray(a) || !Array.isArray(b) || a.length !== b.length) return false;
+  if (a.length !== queued.length) return false;
+  // Each element stands in for one reply; its canonical text plays the part of the raw bytes.
+  return a.every((x, i) =>
+    repliesMatch(queued[i]!, { raw: asText(x), value: x }, { raw: asText(b[i]!), value: b[i]! }),
+  );
 }
