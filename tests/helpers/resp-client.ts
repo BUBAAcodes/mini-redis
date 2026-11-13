@@ -10,6 +10,11 @@ export class RespError {
 export type RespValue =
   string | number | bigint | boolean | null | RespError | RespValue[] | Map<RespValue, RespValue>;
 
+export interface Exchange {
+  raw: string;
+  value: RespValue;
+}
+
 class Incomplete extends Error {}
 
 /** Parses one reply starting at `pos`; throws Incomplete if more bytes are needed. */
@@ -126,6 +131,13 @@ export class TestClient {
   async readRaw(): Promise<string> {
     const [, raw] = await this.next();
     return raw;
+  }
+
+  /** Sends a command and returns its reply both as exact bytes and decoded (differential tests). */
+  async exchange(...argv: string[]): Promise<Exchange> {
+    this.send(...argv);
+    const [value, raw] = await this.next();
+    return { raw, value };
   }
 
   async call(...argv: string[]): Promise<RespValue> {

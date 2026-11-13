@@ -1,6 +1,6 @@
-# CI skeleton (spec section 17). Suites that need Docker, a built server or a
-# long run join as their steps land: differential (step 8), crash (step 15),
-# replication (step 21), fuzz (step 22). The docker build joined in step 5.
+# CI (spec section 17). Suites that need a built server or a long run join as
+# their steps land: crash (step 15), replication (step 21), fuzz (step 22).
+# The docker build joined in step 5, the differential suite in step 8.
 name: CI
 
 on:
@@ -13,6 +13,16 @@ permissions:
 jobs:
   test:
     runs-on: ubuntu-latest
+    services:
+      # The reference server for the differential suite (spec 15.3).
+      redis:
+        image: redis:7.4
+        ports: ['6379:6379']
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 5s
+          --health-timeout 3s
+          --health-retries 10
     steps:
       - uses: actions/checkout@v5
       - uses: actions/setup-node@v5
@@ -24,6 +34,9 @@ jobs:
       - run: npm run typecheck
       - run: npm run build
       - run: npm test -- --coverage
+      - run: npm run test:diff
+        env:
+          OPS: '20000'
       - uses: actions/upload-artifact@v4
         if: always()
         with:
