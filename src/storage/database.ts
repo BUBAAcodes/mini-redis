@@ -2,7 +2,7 @@
  * Db: one numbered database and the only door to its keys (spec 6.1, rule 5).
  *
  * Key design choice: commands never see the dicts. Every read and change goes through a
- * method here, so lazy expiry, WATCH, blocked-key wakeups (18), memory accounting (19),
+ * method here, so lazy expiry, WATCH, blocked-key wakeups, memory accounting (19),
  * the copy-on-write snapshot hook (13) and the dirty counter all hang off a handful of places
  * instead of every command. Each later step fills in its hook where the comments say.
  *
@@ -35,6 +35,10 @@ export class Db {
   readonly expires: Dict<number>;
   /** WATCH registry: key → its watchers, each with its entry (storage/watch.ts). */
   readonly watched = new Map<string, Map<Client, WatchedKey>>();
+  /** key → clients blocked on it, oldest first (blocking/waiters.ts). */
+  readonly blockingKeys = new Map<string, Client[]>();
+  /** Keys with waiters that changed since blocked clients were last served. */
+  readonly readyKeys = new Set<string>();
 
   constructor(
     readonly id: number,
@@ -235,11 +239,13 @@ export class Db {
 
   /**
    * Called exactly once after a command changes a key: fails the EXEC of every client watching
-   * it and counts the change for save points and propagation. Blocked clients (18) and memory
-   * accounting (19) join here.
+   * it, marks it ready for the clients blocked on it, and counts the change for save points and
+   * propagation. Memory accounting (19) joins here. Any change marks a key ready, not just a
+   * push: serving checks that the key holds a list, so an extra mark costs one lookup.
    */
   signalModifiedKey(key: string): void {
     touchWatchedKey(this, key);
+    if (this.blockingKeys.has(key)) this.server.waiters.signalKeyAsReady(this, key);
     this.server.dirty++;
   }
 

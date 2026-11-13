@@ -14,11 +14,14 @@ const handlerName = (name: string): string =>
     .join('') + 'Command';
 
 describe('command table (spec 7.9)', () => {
-  it('has every command built so far (steps 5 to 17)', () => {
+  it('has every command built so far (steps 5 to 18)', () => {
     const names = [...buildCommandTable().keys()].sort();
     expect(names).toEqual(
       [
         'append',
+        'blmove',
+        'blpop',
+        'brpop',
         'client',
         'command',
         'config',

@@ -17,6 +17,12 @@ export class EventLoop {
   private scheduled = false;
   private readonly pendingWrites = new Set<Client>();
 
+  /**
+   * `beforeWrites` runs first in every beforeSleep, before anything is written: the server
+   * runs the input of clients unblocked this turn there, so their replies join this flush.
+   */
+  constructor(private readonly beforeWrites: () => void = () => {}) {}
+
   scheduleBeforeSleep(): void {
     if (this.scheduled) return;
     this.scheduled = true;
@@ -37,6 +43,9 @@ export class EventLoop {
   /** Also called directly at shutdown to flush what's queued. */
   beforeSleep(): void {
     this.scheduled = false;
+    // Unblocked clients' pipelined input first (Redis's processUnblockedClients): it can queue
+    // replies and propagation records, which the steps below then write.
+    this.beforeWrites();
     // In this order, as later steps add them: REPLCONF GETACK for WAIT (step 20), the AOF
     // write and fsync (12), the replication stream (20). Replies only after the AOF (rule 8).
     for (const client of this.pendingWrites) writeClient(client);

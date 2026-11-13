@@ -26,6 +26,10 @@ export const ERR = {
   NOT_INT32: 'ERR value is out of range, value must between -2147483648 and 2147483647',
   NOT_FLOAT: 'ERR value is not a valid float',
   NOT_POSITIVE: 'ERR value is out of range, must be positive',
+  // getTimeoutFromObjectOrReply (timeout.c): BLPOP, BRPOP and BLMOVE timeouts.
+  TIMEOUT_NOT_FLOAT: 'ERR timeout is not a float or out of range',
+  TIMEOUT_NEGATIVE: 'ERR timeout is negative',
+  TIMEOUT_OUT_OF_RANGE: 'ERR timeout is out of range',
   OVERFLOW: 'ERR increment or decrement would overflow',
   NAN_OR_INFINITY: 'ERR increment would produce NaN or Infinity',
   VALUE_NAN_OR_INFINITY: 'ERR value is NaN or Infinity',

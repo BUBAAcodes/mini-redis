@@ -5,12 +5,12 @@
  * Key design choice: the output queue is the client's `Reply`. Handlers append to it, and only
  * beforeSleep turns it into socket writes, once per event-loop turn. So a pipeline of a
  * thousand commands that arrived in one chunk leaves in one write, and replies stay in the
- * order the commands came in (rule 12). Later steps add the blocking, monitor and replica
- * fields here.
+ * order the commands came in (rule 12). Later steps add the monitor and replica fields here.
  *
  * Mirrors Redis networking.c (createClient, freeClient) and the client struct in server.h.
  */
 import type { Socket } from 'node:net';
+import type { BlockState } from '../blocking/waiters.js';
 import type { CommandSpec } from '../commands/command.js';
 import { Reply } from '../protocol/encoder.js';
 import type { RespVersion } from '../protocol/encoder.js';
@@ -61,6 +61,9 @@ export class Client {
   readonly channels = new Set<string>();
   readonly patterns = new Set<string>();
 
+  /** What a blocked BLPOP, BRPOP or BLMOVE waits for; the keys' FIFOs are in its Db. */
+  bstate: BlockState | null = null;
+
   constructor(
     readonly id: number,
     readonly socket: Socket,
@@ -73,6 +76,11 @@ export class Client {
 
   get resp(): RespVersion {
     return this.reply.resp;
+  }
+
+  /** Parked by a blocking command: its later input waits in the parser (spec 9.2). */
+  get blocked(): boolean {
+    return this.bstate !== null;
   }
 
   /** For log lines about one client, like Redis's catClientInfoString (shortened). */

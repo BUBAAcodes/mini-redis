@@ -14,6 +14,7 @@
 import { randomBytes } from 'node:crypto';
 import net from 'node:net';
 import type { Socket } from 'node:net';
+import { Waiters } from '../blocking/waiters.js';
 import { dispatch } from '../commands/dispatch.js';
 import type { CommandTable } from '../commands/command.js';
 import { buildCommandTable } from '../commands/registry.js';
@@ -71,7 +72,7 @@ export class Server {
   readonly dbs: Db[];
   readonly clients = new Map<number, Client>();
   readonly commands: CommandTable = buildCommandTable();
-  readonly eventLoop = new EventLoop();
+  readonly eventLoop = new EventLoop(() => this.processUnblockedClients());
   readonly propagator = new Propagator(() => this.eventLoop.scheduleBeforeSleep());
   readonly cron: Cron;
   /** Channels and patterns (spec 9.11); a frame goes onto the client's output queue. */
@@ -79,6 +80,8 @@ export class Server {
     client.reply.push(frame);
     this.queueReply(client);
   });
+  /** Clients blocked by BLPOP, BRPOP and BLMOVE (spec 9.12). */
+  readonly waiters = new Waiters(this);
   /** 40 hex characters, new on every start (spec 7.7). */
   readonly runId = randomBytes(20).toString('hex');
   readonly startTime = Date.now();
@@ -99,6 +102,8 @@ export class Server {
   /** The db the next active-expiry cycle starts at (spec 9.3: resume where it stopped). */
   activeExpireDb = 0;
 
+  /** Served or timed out this turn: their buffered input runs in the next beforeSleep. */
+  private readonly unblockedClients = new Set<Client>();
   private nextClientId = 1;
   private listener: net.Server | null = null;
   private shuttingDown = false;
@@ -170,6 +175,16 @@ export class Server {
     this.eventLoop.queueClient(client);
   }
 
+  /**
+   * A client just left the blocked state with a reply queued. Its later pipelined commands
+   * run from beforeSleep rather than here, so they never run nested inside the command (or
+   * timer) that unblocked it.
+   */
+  queueUnblocked(client: Client): void {
+    this.unblockedClients.add(client);
+    this.queueReply(client);
+  }
+
   resetStats(): void {
     this.stats = newStats();
     this.commandStats.clear();
@@ -214,8 +229,8 @@ export class Server {
   /** Runs every complete command in the client's input, in order (spec 9.1, step 2). */
   private processInput(client: Client): void {
     try {
-      // Blocked clients (step 18) also stop here, leaving later input in the parser.
-      while (!client.closeAfterReply) {
+      // A blocked client stops here too, leaving its later input in the parser (spec 9.2).
+      while (!client.closeAfterReply && !client.blocked) {
         const cmd = client.parser.next();
         if (cmd === null) break;
         if (cmd.argv.length > 0) dispatch(this, client, cmd.argv);
@@ -240,12 +255,24 @@ export class Server {
     if (client.reply.pendingBytes > 0 || client.closeAfterReply) this.queueReply(client);
   }
 
+  /** Runs what unblocked clients pipelined; running it may unblock more, so loop. */
+  private processUnblockedClients(): void {
+    while (this.unblockedClients.size > 0) {
+      const client = this.unblockedClients.values().next().value!;
+      this.unblockedClients.delete(client);
+      if (!client.closed && !client.blocked) this.processInput(client);
+    }
+  }
+
   private freeClient(client: Client): void {
     client.closed = true;
     this.clients.delete(client.id);
     this.eventLoop.forget(client);
-    // A gone client must not stay in any db's WATCH registry or in the pub/sub hub.
+    // A gone client must not stay in any db's WATCH registry, in the pub/sub hub, or blocked
+    // on a key with a live timer.
     unwatchAllKeys(client);
     this.pubsub.unsubscribeAll(client);
+    this.waiters.unblock(client);
+    this.unblockedClients.delete(client);
   }
 }

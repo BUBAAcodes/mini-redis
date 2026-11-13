@@ -30,7 +30,6 @@ import { unwatchAllKeys } from '../storage/watch.js';
 import { CommandContext, arityOk, lookupSubcommand } from './command.js';
 import type { CommandSpec } from './command.js';
 
-/** The commands that run at once inside MULTI instead of being queued (spec 9.1 step 5). */
 /** What a RESP2 client with subscriptions may run (spec 9.11); RESET joins in step 22. */
 const SUBSCRIBER_COMMANDS = new Set([
   'subscribe',
@@ -41,6 +40,7 @@ const SUBSCRIBER_COMMANDS = new Set([
   'quit',
 ]);
 
+/** The commands that run at once inside MULTI instead of being queued (spec 9.1 step 5). */
 const RUN_INSIDE_MULTI = new Set(['exec', 'discard', 'multi', 'watch', 'quit']);
 
 export function dispatch(server: Server, client: Client, argv: readonly string[]): void {
@@ -147,14 +147,17 @@ export function call(
   }
   const usec = Number(process.hrtime.bigint() - start) / 1000;
 
-  // 9. Stats; SLOWLOG and MONITOR (step 23) also feed from here.
+  // 9. Stats; SLOWLOG and MONITOR (step 23) also feed from here. A command that blocked is
+  //    counted once, when it's served (it runs again) or times out, as in Redis.
   server.stats.totalCommandsProcessed++;
-  server.recordCommandStats(spec.name, usec);
+  if (!client.blocked) server.recordCommandStats(spec.name, usec);
   client.lastCommand = spec.name;
 
   // 10. Propagate: the command's own record only if it's a write that changed something.
   const changed = server.dirty > dirtyBefore && spec.flags.includes('write');
   server.propagator.end(db.id, argv, changed);
-  // 11. Serving blocked clients whose keys became ready (step 18) goes here, after the whole
-  //     EXEC rather than after each of its commands.
+  // 11. Serve blocked clients whose keys became ready, after this command's record so each
+  //    pop replays after the push that fed it, and after the whole EXEC rather than after
+  //    each of its commands.
+  if (!options.inExec) server.waiters.handleClientsBlockedOnKeys();
 }

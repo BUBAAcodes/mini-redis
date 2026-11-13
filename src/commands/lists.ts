@@ -1,6 +1,7 @@
 /**
- * List commands (spec 8.3), on the Quicklist (spec 10.4). BLPOP, BRPOP and BLMOVE come in step
- * 18; LPUSHX, RPUSHX, LPOS and RPOPLPUSH are † (left to write by hand).
+ * List commands (spec 8.3), on the Quicklist (spec 10.4), including BLPOP, BRPOP and BLMOVE
+ * (spec 9.12; the waiting itself is in blocking/waiters.ts). LPUSHX, RPUSHX, LPOS and RPOPLPUSH
+ * are † (left to write by hand).
  *
  * Key design choice: each handler parses and checks its arguments in the same order as Redis's
  * (some parse before the key lookup, some after), so the same bad call gets the same error on
@@ -10,8 +11,10 @@
  * it isn't propagated.
  *
  * Mirrors Redis t_list.c (pushGenericCommand, popGenericCommand, llenCommand, lrangeCommand,
- * lindexCommand, lsetCommand, linsertCommand, lremCommand, ltrimCommand, lmoveGenericCommand).
+ * lindexCommand, lsetCommand, linsertCommand, lremCommand, ltrimCommand, lmoveGenericCommand,
+ * blockingPopGenericCommand, blmoveGenericCommand).
  */
+import { parseTimeout } from '../blocking/waiters.js';
 import { ERR, ReplyError, wrongArity } from '../protocol/errors.js';
 import { createListObject } from '../storage/redis-object.js';
 import type { ListObject } from '../storage/redis-object.js';
@@ -191,6 +194,11 @@ export function ltrimCommand(ctx: CommandContext): void {
 export function lmoveCommand(ctx: CommandContext): void {
   const from = parseEnd(ctx.argv[3]!);
   const to = parseEnd(ctx.argv[4]!);
+  lmoveGeneric(ctx, from, to);
+}
+
+/** LMOVE's work, shared with BLMOVE: source and destination are argv[1] and argv[2]. */
+function lmoveGeneric(ctx: CommandContext, from: End, to: End): void {
   const srcKey = ctx.argv[1]!;
   const dstKey = ctx.argv[2]!;
   const src = lookupWriteOfType(ctx, srcKey, 'list');
@@ -216,6 +224,54 @@ export function lmoveCommand(ctx: CommandContext): void {
   ctx.reply.bulk(value);
 }
 
+/**
+ * BLPOP and BRPOP (spec 9.12): the timeout is checked first, then the keys in order. The first
+ * list found is popped like LPOP, so a key of another type before it is WRONGTYPE. Nothing
+ * ready means block, except inside a transaction, which must never wait: null at once.
+ * Served waiters run this again (blocking/waiters.ts), so this is also the serving code.
+ */
+function blockingPopGeneric(ctx: CommandContext, end: End): void {
+  const keys = ctx.argv.slice(1, -1);
+  const timeout = parseTimeout(ctx.argv[ctx.argv.length - 1]!, ctx.server.cmdTime);
+  for (const key of keys) {
+    const list = lookupWriteOfType(ctx, key, 'list');
+    if (list === null) continue;
+    const value = end === 'LEFT' ? list.value.popHead()! : list.value.popTail()!;
+    afterRemove(ctx, key, list);
+    // A replica or an AOF replay must pop, never wait (spec 9.12).
+    ctx.rewritePropagation([end === 'LEFT' ? 'LPOP' : 'RPOP', key]);
+    ctx.reply.array([key, value]);
+    return;
+  }
+  if (ctx.client.multi) {
+    ctx.reply.nullArray();
+    return;
+  }
+  ctx.server.waiters.block(ctx, keys, timeout);
+}
+
+export const blpopCommand = (ctx: CommandContext): void => blockingPopGeneric(ctx, 'LEFT');
+export const brpopCommand = (ctx: CommandContext): void => blockingPopGeneric(ctx, 'RIGHT');
+
+/**
+ * BLMOVE: the directions, then the timeout, then LMOVE if the source has elements (so its
+ * destination's type is checked only then). Inside MULTI a missing source gives LMOVE's own
+ * null bulk, though a timeout gives a null array, as in Redis.
+ */
+export function blmoveCommand(ctx: CommandContext): void {
+  const from = parseEnd(ctx.argv[3]!);
+  const to = parseEnd(ctx.argv[4]!);
+  const timeout = parseTimeout(ctx.argv[5]!, ctx.server.cmdTime);
+  const srcKey = ctx.argv[1]!;
+  if (lookupWriteOfType(ctx, srcKey, 'list') === null) {
+    if (ctx.client.multi) ctx.reply.nullBulk();
+    else ctx.server.waiters.block(ctx, [srcKey], timeout);
+    return;
+  }
+  lmoveGeneric(ctx, from, to);
+  ctx.rewritePropagation(['LMOVE', srcKey, ctx.argv[2]!, ctx.argv[3]!, ctx.argv[4]!]);
+}
+
 export const listCommands: CommandSpec[] = [
   command('lpush', -3, ['write', 'denyoom'], [1, 1, 1], lpushCommand),
   command('rpush', -3, ['write', 'denyoom'], [1, 1, 1], rpushCommand),
@@ -229,4 +285,7 @@ export const listCommands: CommandSpec[] = [
   command('lrem', 4, ['write'], [1, 1, 1], lremCommand),
   command('ltrim', 4, ['write'], [1, 1, 1], ltrimCommand),
   command('lmove', 5, ['write', 'denyoom'], [1, 2, 1], lmoveCommand),
+  command('blpop', -3, ['write', 'blocking'], [1, -2, 1], blpopCommand),
+  command('brpop', -3, ['write', 'blocking'], [1, -2, 1], brpopCommand),
+  command('blmove', 6, ['write', 'denyoom', 'blocking'], [1, 2, 1], blmoveCommand),
 ];
