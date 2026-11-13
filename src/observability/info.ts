@@ -1,0 +1,50 @@
+/**
+ * The INFO text (spec 13.1): `# Section` headers, `field:value` lines, sections separated by a
+ * blank line.
+ *
+ * Key design choice: each section is a function from the Server to its fields, listed in
+ * Redis's order, so `INFO a b` and `INFO all` share one code path and print sections in the
+ * same order whatever order they were asked for. Step 5 has the fields ioredis and the tests
+ * need (`loading:0` is how ioredis knows the server is ready); step 23 fills in the rest of
+ * section 13.1.
+ *
+ * Mirrors Redis server.c (genRedisInfoString, infoCommand).
+ */
+import type { Server } from '../server/server.js';
+import { MINIREDIS_VERSION, REDIS_VERSION } from '../server/version.js';
+
+type Fields = Array<[string, string | number]>;
+
+const SECTIONS: ReadonlyArray<
+  readonly [name: string, title: string, fields: (s: Server) => Fields]
+> = [
+  [
+    'server',
+    'Server',
+    (s) => [
+      ['redis_version', REDIS_VERSION],
+      ['miniredis_version', MINIREDIS_VERSION],
+      ['run_id', s.runId],
+      ['tcp_port', s.port],
+      ['uptime_in_seconds', Math.floor((Date.now() - s.startTime) / 1000)],
+    ],
+  ],
+  ['persistence', 'Persistence', () => [['loading', 0]]],
+];
+
+/** Words that select every section; Redis's `default` set equals `all` until we have more. */
+const ALL = new Set(['all', 'everything', 'default']);
+
+/** INFO's text for the requested sections (none = all). Unknown names are ignored. */
+export function genInfoString(server: Server, requested: readonly string[]): string {
+  const wanted = new Set(requested.map((r) => r.toLowerCase()));
+  const all = wanted.size === 0 || [...wanted].some((w) => ALL.has(w));
+  const parts: string[] = [];
+  for (const [name, title, fields] of SECTIONS) {
+    if (!all && !wanted.has(name)) continue;
+    let text = `# ${title}\r\n`;
+    for (const [field, value] of fields(server)) text += `${field}:${value}\r\n`;
+    parts.push(text);
+  }
+  return parts.join('\r\n');
+}

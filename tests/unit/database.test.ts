@@ -1,0 +1,83 @@
+import { describe, expect, it } from 'vitest';
+import { lruClockNow } from '../../src/server/cron.js';
+import { Server } from '../../src/server/server.js';
+import { createStringObject } from '../../src/storage/redis-object.js';
+
+// A server that never listens: Db only needs its stats, clocks and dict options.
+const newDb = () => {
+  const server = new Server({ log: () => {}, seed: 1 });
+  return { server, db: server.dbs[0]! };
+};
+
+describe('Db (spec 6.1)', () => {
+  it('has one Db per configured database, numbered from 0', () => {
+    const { server } = newDb();
+    expect(server.dbs).toHaveLength(16);
+    expect(server.dbs.map((d) => d.id)).toEqual([...Array(16).keys()]);
+  });
+
+  it('lookupRead counts hits and misses and touches the LRU clock', () => {
+    const { server, db } = newDb();
+    db.add('k', createStringObject('v'));
+    server.lruClock = 1234;
+    expect(db.lookupRead('k')?.value).toBe('v');
+    expect(db.lookupRead('nope')).toBeNull();
+    expect(server.stats).toMatchObject({ keyspaceHits: 1, keyspaceMisses: 1 });
+    expect(db.peek('k')!.lru).toBe(1234);
+  });
+
+  it('peek and lookupWrite leave the stats alone', () => {
+    const { server, db } = newDb();
+    db.add('k', createStringObject('v'));
+    server.lruClock = 1;
+    expect(db.peek('k')?.value).toBe('v');
+    expect(db.peek('k')!.lru).not.toBe(1);
+    expect(db.lookupWrite('k')?.value).toBe('v');
+    expect(db.lookupWrite('nope')).toBeNull();
+    expect(server.stats).toMatchObject({ keyspaceHits: 0, keyspaceMisses: 0 });
+  });
+
+  it('add refuses an existing key; setKey replaces', () => {
+    const { db } = newDb();
+    db.add('k', createStringObject('1'));
+    expect(() => db.add('k', createStringObject('2'))).toThrow();
+    db.setKey('k', createStringObject('3'));
+    expect(db.peek('k')?.value).toBe('3');
+    expect(db.size).toBe(1);
+  });
+
+  it('setKey drops the TTL unless keepTtl; delete drops it too', () => {
+    const { db } = newDb();
+    db.add('k', createStringObject('1'));
+    db.expires.set('k', Date.now() + 10_000);
+    db.setKey('k', createStringObject('2'), { keepTtl: true });
+    expect(db.expires.has('k')).toBe(true);
+    db.setKey('k', createStringObject('3'));
+    expect(db.expires.has('k')).toBe(false);
+    db.expires.set('k', Date.now() + 10_000);
+    expect(db.delete('k')).toBe(true);
+    expect(db.expires.has('k')).toBe(false);
+    expect(db.delete('k')).toBe(false);
+  });
+
+  it('signalModifiedKey counts changes in server.dirty', () => {
+    const { server, db } = newDb();
+    db.signalModifiedKey('a');
+    db.signalModifiedKey('b');
+    expect(server.dirty).toBe(2);
+  });
+
+  it('cron finishes a rehash that operations alone left running', () => {
+    const { db } = newDb();
+    for (let i = 0; i < 1000; i++) db.setKey(`k${i}`, createStringObject('v'));
+    while (!db.dict.isRehashing) db.setKey(`more${db.size}`, createStringObject('v'));
+    db.cron(1000);
+    expect(db.dict.isRehashing).toBe(false);
+    db.dict.check();
+  });
+
+  it('the LRU clock is Unix seconds in 24 bits', () => {
+    expect(lruClockNow(0)).toBe(0);
+    expect(lruClockNow(1000 * 0x1000000 + 5000)).toBe(5);
+  });
+});

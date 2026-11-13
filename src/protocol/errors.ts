@@ -22,6 +22,8 @@ export class ProtocolError extends ReplyError {
 export const ERR = {
   SYNTAX: 'ERR syntax error',
   NOT_INTEGER: 'ERR value is not an integer or out of range',
+  // getIntFromObjectOrReply's message for an int64 outside the int range (SELECT 2147483648).
+  NOT_INT32: 'ERR value is out of range, value must between -2147483648 and 2147483647',
   NOT_FLOAT: 'ERR value is not a valid float',
   OVERFLOW: 'ERR increment or decrement would overflow',
   NAN_OR_INFINITY: 'ERR increment would produce NaN or Infinity',
@@ -45,6 +47,7 @@ export const ERR = {
   NOPROTO: 'NOPROTO unsupported protocol version',
   MAX_CLIENTS: 'ERR max number of clients reached',
   BGSAVE_IN_PROGRESS: 'ERR Background save already in progress',
+  INTERNAL: 'ERR internal error',
 } as const;
 
 export const PROTOCOL = {

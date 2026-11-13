@@ -350,10 +350,11 @@ const unescape = (c: number): number => {
 };
 
 /**
- * sdssplitargs() over line[0, end). C sees the line as a NUL-terminated string, so everything
- * from the first NUL on is the end of input: it ends an unquoted arg and unbalances a quote.
+ * sdssplitargs() over line[0, end); config files use it too, as in Redis. C sees the line as a
+ * NUL-terminated string, so everything from the first NUL on is the end of input: it ends an
+ * unquoted arg and unbalances a quote.
  */
-function splitArgs(line: Buffer, end: number): string[] {
+export function splitArgs(line: Buffer, end: number = line.length): string[] {
   const nul = line.indexOf(NUL);
   const limit = nul !== -1 && nul < end ? nul : end;
   const at = (i: number): number => (i < limit ? line[i]! : NUL);

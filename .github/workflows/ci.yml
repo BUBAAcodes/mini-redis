@@ -1,6 +1,6 @@
 # CI skeleton (spec section 17). Suites that need Docker, a built server or a
-# long run join as their steps land: differential (step 8), docker build
-# (step 5), crash (step 15), replication (step 21), fuzz (step 22).
+# long run join as their steps land: differential (step 8), crash (step 15),
+# replication (step 21), fuzz (step 22). The docker build joined in step 5.
 name: CI
 
 on:
@@ -30,3 +30,10 @@ jobs:
           name: coverage
           path: coverage/
           if-no-files-found: ignore
+
+  docker:
+    # Spec 17 item 5: prove the image builds. Pushing to GHCR comes later.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - run: docker build -t miniredis:ci .

@@ -1,0 +1,64 @@
+/**
+ * scheduleBeforeSleep() and beforeSleep() (spec 9.1, steps 4 and 5): the work done once at the
+ * end of each event-loop turn, after every socket that was readable has been read.
+ *
+ * Key design choice: anything that queues a reply or a propagation record calls
+ * scheduleBeforeSleep(), which arms at most one setImmediate per turn. setImmediate runs in
+ * Node's check phase, right after the poll phase that delivered this turn's socket data, so
+ * one beforeSleep sees every command of the turn: the AOF is written once before any reply
+ * (rule 8), and each client gets one write however many commands it pipelined.
+ * See docs/adr/0003-before-sleep-set-immediate.md.
+ *
+ * Mirrors Redis server.c (beforeSleep) and networking.c (handleClientsWithPendingWrites).
+ */
+import type { Client } from './client.js';
+
+export class EventLoop {
+  private scheduled = false;
+  private readonly pendingWrites = new Set<Client>();
+
+  scheduleBeforeSleep(): void {
+    if (this.scheduled) return;
+    this.scheduled = true;
+    setImmediate(() => this.beforeSleep());
+  }
+
+  /** Marks a client as having output (or a close) waiting, and schedules the flush. */
+  queueClient(client: Client): void {
+    this.pendingWrites.add(client);
+    this.scheduleBeforeSleep();
+  }
+
+  /** Forgets a client that's gone, so a flush never writes to a dead socket. */
+  forget(client: Client): void {
+    this.pendingWrites.delete(client);
+  }
+
+  /** Also called directly at shutdown to flush what's queued. */
+  beforeSleep(): void {
+    this.scheduled = false;
+    // In this order, as later steps add them: REPLCONF GETACK for WAIT (step 20), the AOF
+    // write and fsync (12), the replication stream (20). Replies only after the AOF (rule 8).
+    for (const client of this.pendingWrites) writeClient(client);
+    this.pendingWrites.clear();
+    // Output buffer limits (step 22) are enforced here.
+  }
+}
+
+function writeClient(client: Client): void {
+  if (client.closed) return;
+  const socket = client.socket;
+  if (client.reply.pendingBytes > 0) {
+    // One string per client, one write: cork/uncork keeps it one writev once later steps
+    // write big bulks as separate buffers.
+    socket.cork();
+    socket.write(Buffer.from(client.reply.take(), 'latin1'));
+    socket.uncork();
+  }
+  if (client.closeAfterReply) {
+    client.closed = true;
+    // Close only once the replies have reached the kernel; destroy() so a peer that never
+    // closes its side can't keep the socket half-open.
+    socket.end(() => socket.destroy());
+  }
+}
