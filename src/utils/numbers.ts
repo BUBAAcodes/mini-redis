@@ -78,3 +78,42 @@ export function formatDouble(x: number): string {
         : `${digits.slice(0, point)}.${digits.slice(point)}`;
   return negative ? `-${body}` : body;
 }
+
+/** What C's strtod accepts as a whole string (decimal and inf/infinity; no hex, no nan). */
+const STRTOD = /^[+-]?(?:(?:[0-9]+\.?[0-9]*|\.[0-9]+)(?:[eE][+-]?[0-9]+)?|inf(?:inity)?)$/i;
+const STRTOD_INFINITY = /^[+-]?inf(?:inity)?$/i;
+const C_SPACE = /^[ \t\n\v\f\r]+/;
+
+/** The value strtod reads from all of `s`, with overflow to ±inf and underflow to 0; or null. */
+function strtodWhole(s: string): number | null {
+  if (!STRTOD.test(s)) return null;
+  if (STRTOD_INFINITY.test(s)) return s.startsWith('-') ? -Infinity : Infinity;
+  return Number(s);
+}
+
+/**
+ * A double as Redis's getDoubleFromObject reads it, for ZADD, ZINCRBY and WEIGHTS: strtod
+ * over the whole string, but no empty string, no leading space, no nan, and no finite text that
+ * overflows to ±inf or underflows all the way to 0 (strtod's ERANGE). `inf` and `infinity` are
+ * fine; a subnormal like `1e-310` is too.
+ */
+export function parseStrictDouble(s: string): number | null {
+  if (s.length === 0 || C_SPACE.test(s)) return null;
+  const x = strtodWhole(s);
+  if (x === null) return null;
+  if (!Number.isFinite(x) && !STRTOD_INFINITY.test(s)) return null;
+  if (x === 0 && /[1-9]/.test(s.split(/[eE]/)[0]!)) return null;
+  return x;
+}
+
+/**
+ * A score-range bound's number as zslParseRange reads it: plain strtod, so leading whitespace
+ * is skipped, overflow gives ±inf, underflow gives 0, and an empty string is 0 (strtod converts
+ * nothing and stops at the terminator). Whitespace alone is not a number. nan is refused.
+ */
+export function parseStrtodDouble(s: string): number | null {
+  if (s.length === 0) return 0;
+  const rest = s.replace(C_SPACE, '');
+  if (rest.length === 0) return null;
+  return strtodWhole(rest);
+}

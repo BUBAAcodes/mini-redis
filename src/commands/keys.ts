@@ -18,10 +18,12 @@
  * parseExtendedExpireArgumentsOrReply, ttlGenericCommand, persistCommand).
  */
 import { ERR, ReplyError, invalidExpireTime, unsupportedOption } from '../protocol/errors.js';
+import type { RObj } from '../storage/redis-object.js';
 import { stringMatch } from '../utils/glob.js';
 import { INT64_MAX, INT64_MIN, parseInt64 } from '../utils/numbers.js';
 import { command } from './command.js';
 import type { CommandContext, CommandSpec } from './command.js';
+import { matches, parseCursor, parseScanOptions, scanPage } from './scan.js';
 
 export function delCommand(ctx: CommandContext): void {
   let deleted = 0;
@@ -59,52 +61,15 @@ export function keysCommand(ctx: CommandContext): void {
   ctx.reply.array(ctx.db.allKeys().filter((key) => all || stringMatch(pattern, key)));
 }
 
-/** Redis reads the cursor with strtoul: digits only, and it must fit in 64 bits. */
-function parseCursor(s: string): number {
-  if (!/^[0-9]+$/.test(s) || BigInt(s) > 0xffff_ffff_ffff_ffffn) {
-    throw new ReplyError(ERR.INVALID_CURSOR);
-  }
-  // Our cursors are 32-bit (spec 10.2); a larger one just wraps, as a stale cursor would.
-  return Number(BigInt(s) & 0xffff_ffffn);
-}
-
 export function scanCommand(ctx: CommandContext): void {
   const cursor = parseCursor(ctx.argv[1]!);
-  let count = 10;
-  let pattern: string | null = null;
-  let type: string | null = null;
-  for (let i = 2; i < ctx.argv.length;) {
-    const opt = ctx.argv[i]!.toUpperCase();
-    const hasValue = i + 1 < ctx.argv.length;
-    if (opt === 'COUNT' && hasValue) {
-      const n = parseInt64(ctx.argv[i + 1]!);
-      if (n === null) throw new ReplyError(ERR.NOT_INTEGER);
-      if (n < 1n) throw new ReplyError(ERR.SYNTAX);
-      count = n > 0x7fff_ffffn ? 0x7fff_ffff : Number(n);
-      i += 2;
-    } else if (opt === 'MATCH' && hasValue) {
-      pattern = ctx.argv[i + 1]!;
-      i += 2;
-    } else if (opt === 'TYPE' && hasValue) {
-      type = ctx.argv[i + 1]!.toLowerCase();
-      i += 2;
-    } else {
-      throw new ReplyError(ERR.SYNTAX);
-    }
-  }
-
-  // Keep stepping until `count` entries or `count × 10` steps, whichever comes first (spec 10.2).
-  const visited: Array<[string, string]> = [];
-  let next = cursor;
-  let steps = count * 10;
-  do {
-    next = ctx.db.scanStep(next, (key, obj) => visited.push([key, obj.type]));
-  } while (next !== 0 && --steps > 0 && visited.length < count);
+  const opts = parseScanOptions(ctx.argv, 2, true);
+  const { next, visited } = scanPage<RObj>(cursor, opts.count, (c, fn) => ctx.db.scanStep(c, fn));
 
   const keys: string[] = [];
-  for (const [key, keyType] of visited) {
-    if (type !== null && keyType !== type) continue;
-    if (pattern !== null && pattern !== '*' && !stringMatch(pattern, key)) continue;
+  for (const [key, obj] of visited) {
+    if (opts.type !== null && obj.type !== opts.type) continue;
+    if (!matches(opts, key)) continue;
     // Checked last, as in Redis, so only keys that passed the filters get expired here.
     if (ctx.db.expireIfNeeded(key)) continue;
     keys.push(key);

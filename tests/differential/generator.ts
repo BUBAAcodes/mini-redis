@@ -36,6 +36,8 @@ const WORDS = [
   'x y',
 ];
 
+const MEMBERS = ['a', 'b', 'c', 'd', 'e', '1', '2', '10', ''];
+
 export class Gen {
   constructor(readonly rnd: Random) {}
 
@@ -70,6 +72,43 @@ export class Gen {
     for (let i = 0, n = 1 + this.rnd.int(8); i < n; i++)
       s += String.fromCharCode(this.rnd.int(256));
     return s;
+  }
+
+  /**
+   * A collection element: mostly from a tiny alphabet, so pivots, LREM values, set members and
+   * hash fields collide, and sometimes any value (binary included).
+   */
+  member(): string {
+    return this.chance(80) ? this.pick(MEMBERS) : this.value();
+  }
+
+  members(max: number): string[] {
+    return Array.from({ length: 1 + this.rnd.int(max) }, () => this.member());
+  }
+
+  /** A score: a quarter (exact everywhere, spec 7.2), sometimes an infinity. */
+  score(): string {
+    return this.chance(8) ? this.pick(['inf', '-inf', '+inf']) : this.quarter();
+  }
+
+  /** A score-range bound: a quarter, maybe exclusive, or an infinity. */
+  scoreBound(): string {
+    if (this.chance(15)) return this.pick(['-inf', '+inf']);
+    return (this.chance(30) ? '(' : '') + this.quarter();
+  }
+
+  /** A lex-range bound over the member alphabet. */
+  lexBound(): string {
+    if (this.chance(20)) return this.pick(['-', '+']);
+    return this.pick(['[', '(']) + this.pick(MEMBERS);
+  }
+
+  /**
+   * A key for the lex commands. Lex ranges are only defined when every score is equal, so these
+   * keys are only written by `ZADD <key> 0 …` and ZREM: no other command reaches them.
+   */
+  lexKey(): string {
+    return `z${this.rnd.int(3)}`;
   }
 
   int(lo: number, hi: number): string {
@@ -120,6 +159,15 @@ const setTtl = (g: Gen): string[] => {
     default:
       return [];
   }
+};
+
+/** ZUNIONSTORE / ZINTERSTORE: quarter weights keep every product and sum exact. */
+const zstoreArgs = (g: Gen): string[] => {
+  const srcs = keys(g);
+  const out = [g.key(), String(srcs.length), ...srcs];
+  if (g.chance(30)) out.push('WEIGHTS', ...srcs.map(() => g.quarter()));
+  if (g.chance(30)) out.push('AGGREGATE', g.pick(['SUM', 'MIN', 'MAX']));
+  return out;
 };
 
 /** name → [weight, builder]. Keep the weights roughly even so every command is exercised. */
@@ -185,6 +233,111 @@ const TEMPLATES: Record<string, [number, Template]> = {
   ttl: [3, (g) => [g.key()]],
   pttl: [3, (g) => [g.key()]],
   persist: [2, (g) => [g.key()]],
+  // Lists (step 9). Indexes stay small so they land inside and just outside the lists.
+  lpush: [4, (g) => [g.key(), ...g.members(3)]],
+  rpush: [4, (g) => [g.key(), ...g.members(3)]],
+  lpop: [2, (g) => [g.key(), ...(g.chance(40) ? [g.int(0, 4)] : [])]],
+  rpop: [2, (g) => [g.key(), ...(g.chance(40) ? [g.int(0, 4)] : [])]],
+  llen: [2, (g) => [g.key()]],
+  lrange: [3, (g) => [g.key(), g.int(-6, 6), g.int(-6, 6)]],
+  lindex: [2, (g) => [g.key(), g.int(-6, 6)]],
+  lset: [2, (g) => [g.key(), g.int(-4, 4), g.member()]],
+  linsert: [2, (g) => [g.key(), g.pick(['BEFORE', 'AFTER']), g.member(), g.member()]],
+  lrem: [2, (g) => [g.key(), g.int(-2, 2), g.member()]],
+  ltrim: [1, (g) => [g.key(), g.int(-6, 6), g.int(-6, 6)]],
+  lmove: [2, (g) => [g.key(), g.key(), g.pick(['LEFT', 'RIGHT']), g.pick(['LEFT', 'RIGHT'])]],
+  // Hashes (step 10). HINCRBYFLOAT only touches the x0/x1 fields, which only ever hold
+  // quarters, for the same reason as the f keys (spec 7.2).
+  hset: [
+    5,
+    (g) =>
+      g.chance(15)
+        ? [g.key(), g.pick(['x0', 'x1']), g.quarter()]
+        : [g.key(), ...g.members(3).flatMap((f) => [f, g.value()])],
+  ],
+  hget: [3, (g) => [g.key(), g.member()]],
+  hmget: [2, (g) => [g.key(), ...g.members(3)]],
+  hdel: [2, (g) => [g.key(), ...g.members(2)]],
+  hexists: [2, (g) => [g.key(), g.member()]],
+  hlen: [2, (g) => [g.key()]],
+  hkeys: [1, (g) => [g.key()]],
+  hvals: [1, (g) => [g.key()]],
+  hgetall: [2, (g) => [g.key()]],
+  hincrby: [2, (g) => [g.key(), g.member(), g.int(-100, 100)]],
+  hincrbyfloat: [2, (g) => [g.key(), g.pick(['x0', 'x1']), g.quarter()]],
+  // Sets (step 10). SPOP, SRANDMEMBER and SSCAN are random or cursor-based: never generated.
+  sadd: [5, (g) => [g.key(), ...g.members(4)]],
+  srem: [2, (g) => [g.key(), ...g.members(2)]],
+  sismember: [2, (g) => [g.key(), g.member()]],
+  smembers: [2, (g) => [g.key()]],
+  scard: [2, (g) => [g.key()]],
+  sinter: [2, keys],
+  sunion: [2, keys],
+  sdiff: [2, keys],
+  sinterstore: [1, (g) => [g.key(), ...keys(g)]],
+  sunionstore: [1, (g) => [g.key(), ...keys(g)]],
+  sdiffstore: [1, (g) => [g.key(), ...keys(g)]],
+  // Sorted sets (step 11). Scores are quarters, so sums and weights stay exact (spec 7.2).
+  zadd: [
+    6,
+    (g) => {
+      if (g.chance(15)) return [g.lexKey(), ...g.members(3).flatMap((m) => ['0', m])];
+      const flags: string[] = [];
+      if (g.chance(20)) flags.push(g.pick(['NX', 'XX']));
+      if (g.chance(20)) flags.push(g.pick(['GT', 'LT']));
+      if (g.chance(20)) flags.push('CH');
+      if (g.chance(10)) return [g.key(), ...flags, 'INCR', g.score(), g.member()];
+      return [g.key(), ...flags, ...g.members(3).flatMap((m) => [g.score(), m])];
+    },
+  ],
+  zincrby: [2, (g) => [g.key(), g.quarter(), g.member()]],
+  zscore: [2, (g) => [g.key(), g.member()]],
+  zcard: [2, (g) => [g.pick([g.key(), g.lexKey()])]],
+  zcount: [2, (g) => [g.key(), g.scoreBound(), g.scoreBound()]],
+  zrange: [
+    4,
+    (g) => {
+      const ws = g.chance(30) ? ['WITHSCORES'] : [];
+      const rev = g.chance(30) ? ['REV'] : [];
+      const lim = g.chance(30) ? ['LIMIT', g.int(-1, 3), g.int(-1, 3)] : [];
+      switch (g.rnd.int(3)) {
+        case 0:
+          return [g.key(), g.int(-6, 6), g.int(-6, 6), ...rev, ...ws];
+        case 1:
+          return [g.key(), g.scoreBound(), g.scoreBound(), 'BYSCORE', ...rev, ...lim, ...ws];
+        default:
+          return [g.lexKey(), g.lexBound(), g.lexBound(), 'BYLEX', ...rev, ...lim];
+      }
+    },
+  ],
+  zrangebyscore: [
+    2,
+    (g) => [
+      g.key(),
+      g.scoreBound(),
+      g.scoreBound(),
+      ...(g.chance(30) ? ['WITHSCORES'] : []),
+      ...(g.chance(30) ? ['LIMIT', g.int(-1, 3), g.int(-1, 3)] : []),
+    ],
+  ],
+  zrevrangebyscore: [
+    2,
+    (g) => [g.key(), g.scoreBound(), g.scoreBound(), ...(g.chance(30) ? ['WITHSCORES'] : [])],
+  ],
+  zrangebylex: [2, (g) => [g.lexKey(), g.lexBound(), g.lexBound()]],
+  zrevrange: [
+    2,
+    (g) => [g.key(), g.int(-6, 6), g.int(-6, 6), ...(g.chance(30) ? ['WITHSCORES'] : [])],
+  ],
+  zrank: [2, (g) => [g.key(), g.member(), ...(g.chance(30) ? ['WITHSCORE'] : [])]],
+  zrevrank: [2, (g) => [g.key(), g.member(), ...(g.chance(30) ? ['WITHSCORE'] : [])]],
+  zrem: [2, (g) => [g.pick([g.key(), g.lexKey()]), ...g.members(2)]],
+  zremrangebyrank: [1, (g) => [g.key(), g.int(-6, 6), g.int(-6, 6)]],
+  zremrangebyscore: [1, (g) => [g.key(), g.scoreBound(), g.scoreBound()]],
+  zpopmin: [1, (g) => [g.key(), ...(g.chance(40) ? [g.int(0, 3)] : [])]],
+  zpopmax: [1, (g) => [g.key(), ...(g.chance(40) ? [g.int(0, 3)] : [])]],
+  zunionstore: [1, (g) => zstoreArgs(g)],
+  zinterstore: [1, (g) => zstoreArgs(g)],
   ping: [1, (g) => (g.chance(50) ? [] : [g.value()])],
   echo: [1, (g) => [g.value()]],
 };

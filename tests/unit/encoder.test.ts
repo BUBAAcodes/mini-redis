@@ -136,10 +136,11 @@ describe('Reply builders (spec 7.3)', () => {
 });
 
 describe('formatDouble (redis:7.4 d2string: exact integers within 2^62, else fpconv)', () => {
-  // Every pair was read back from the reference with ZADD + ZSCORE.
+  // Every pair was read back from the reference with ZADD + ZSCORE, except -0: a small zset
+  // stores integral scores as integers, which drops the sign, so -0 was read from a ZINCRBY reply.
   const cases: [number, string][] = [
     [0, '0'],
-    [-0, '0'],
+    [-0, '-0'],
     [0.1, '0.1'],
     [2.5, '2.5'],
     [-2.5, '-2.5'],

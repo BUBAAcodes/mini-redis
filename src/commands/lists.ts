@@ -1,0 +1,232 @@
+/**
+ * List commands (spec 8.3), on the Quicklist (spec 10.4). BLPOP, BRPOP and BLMOVE come in step
+ * 18; LPUSHX, RPUSHX, LPOS and RPOPLPUSH are † (left to write by hand).
+ *
+ * Key design choice: each handler parses and checks its arguments in the same order as Redis's
+ * (some parse before the key lookup, some after), so the same bad call gets the same error on
+ * both servers. Nothing changes before every check has passed (rule 4). A list that becomes
+ * empty is deleted at once, so no command can see an empty list; its TTL goes with it. A command
+ * that changed nothing (LPOP 0, LTRIM that keeps everything) doesn't call signalModifiedKey, so
+ * it isn't propagated.
+ *
+ * Mirrors Redis t_list.c (pushGenericCommand, popGenericCommand, llenCommand, lrangeCommand,
+ * lindexCommand, lsetCommand, linsertCommand, lremCommand, ltrimCommand, lmoveGenericCommand).
+ */
+import { ERR, ReplyError, wrongArity } from '../protocol/errors.js';
+import { createListObject } from '../storage/redis-object.js';
+import type { ListObject } from '../storage/redis-object.js';
+import { clampToSafe, parseInt64 } from '../utils/numbers.js';
+import { command } from './command.js';
+import type { CommandContext, CommandSpec } from './command.js';
+import { lookupReadOfType, lookupWriteOfType } from './typed.js';
+
+/** A long argument (getLongFromObjectOrReply), clamped to a safe JS number (spec 7.2). */
+function parseLong(s: string): number {
+  const n = parseInt64(s);
+  if (n === null) throw new ReplyError(ERR.NOT_INTEGER);
+  return clampToSafe(n);
+}
+
+type End = 'LEFT' | 'RIGHT';
+
+function parseEnd(s: string): End {
+  const e = s.toUpperCase();
+  if (e !== 'LEFT' && e !== 'RIGHT') throw new ReplyError(ERR.SYNTAX);
+  return e;
+}
+
+/** The list under `key` for a push, created and added if missing. */
+function listForPush(ctx: CommandContext, key: string): ListObject {
+  const existing = lookupWriteOfType(ctx, key, 'list');
+  if (existing !== null) return existing;
+  const obj = createListObject(ctx.server.config.get('list-max-node-items'));
+  ctx.db.add(key, obj);
+  return obj;
+}
+
+/** After a removal: delete the key if the list is empty, then signal the change once. */
+function afterRemove(ctx: CommandContext, key: string, list: ListObject): void {
+  if (list.value.length === 0) ctx.db.delete(key);
+  ctx.db.signalModifiedKey(key);
+}
+
+/** Redis's start/end normalisation for LRANGE and LTRIM: null when the range is empty. */
+function normaliseRange(start: number, end: number, len: number): [number, number] | null {
+  if (start < 0) start += len;
+  if (end < 0) end += len;
+  if (start < 0) start = 0;
+  if (start > end || start >= len) return null;
+  if (end >= len) end = len - 1;
+  return [start, end];
+}
+
+function pushGeneric(ctx: CommandContext, end: End): void {
+  const key = ctx.argv[1]!;
+  const list = listForPush(ctx, key);
+  for (let i = 2; i < ctx.argv.length; i++) {
+    if (end === 'LEFT') list.value.pushHead(ctx.argv[i]!);
+    else list.value.pushTail(ctx.argv[i]!);
+  }
+  ctx.db.signalModifiedKey(key);
+  ctx.reply.integer(list.value.length);
+}
+
+export const lpushCommand = (ctx: CommandContext): void => pushGeneric(ctx, 'LEFT');
+export const rpushCommand = (ctx: CommandContext): void => pushGeneric(ctx, 'RIGHT');
+
+function popGeneric(ctx: CommandContext, end: End): void {
+  const key = ctx.argv[1]!;
+  let count = -1;
+  // Arity -2 lets any number through; Redis takes at most a count.
+  if (ctx.argv.length > 3) throw new ReplyError(wrongArity(ctx.argv[0]!.toLowerCase()));
+  if (ctx.argv.length === 3) {
+    // Redis passes its range message as the parse error too, so 'abc' is "out of range".
+    const n = parseInt64(ctx.argv[2]!);
+    if (n === null || n < 0n) throw new ReplyError(ERR.NOT_POSITIVE);
+    count = clampToSafe(n);
+  }
+  const list = lookupWriteOfType(ctx, key, 'list');
+  if (list === null) {
+    if (count === -1) ctx.reply.nullBulk();
+    else ctx.reply.nullArray();
+    return;
+  }
+  const pop = (): string => (end === 'LEFT' ? list.value.popHead()! : list.value.popTail()!);
+  if (count === -1) {
+    ctx.reply.bulk(pop());
+  } else {
+    const n = Math.min(count, list.value.length);
+    const out: string[] = [];
+    for (let i = 0; i < n; i++) out.push(pop());
+    ctx.reply.array(out);
+    if (n === 0) return;
+  }
+  afterRemove(ctx, key, list);
+}
+
+export const lpopCommand = (ctx: CommandContext): void => popGeneric(ctx, 'LEFT');
+export const rpopCommand = (ctx: CommandContext): void => popGeneric(ctx, 'RIGHT');
+
+export function llenCommand(ctx: CommandContext): void {
+  const list = lookupReadOfType(ctx, ctx.argv[1]!, 'list');
+  ctx.reply.integer(list === null ? 0 : list.value.length);
+}
+
+export function lrangeCommand(ctx: CommandContext): void {
+  const start = parseLong(ctx.argv[2]!);
+  const end = parseLong(ctx.argv[3]!);
+  const list = lookupReadOfType(ctx, ctx.argv[1]!, 'list');
+  const r = list === null ? null : normaliseRange(start, end, list.value.length);
+  ctx.reply.array(r === null ? [] : list!.value.range(r[0], r[1]));
+}
+
+export function lindexCommand(ctx: CommandContext): void {
+  const list = lookupReadOfType(ctx, ctx.argv[1]!, 'list');
+  if (list === null) {
+    ctx.reply.nullBulk();
+    return;
+  }
+  const value = list.value.index(parseLong(ctx.argv[2]!));
+  if (value === undefined) ctx.reply.nullBulk();
+  else ctx.reply.bulk(value);
+}
+
+export function lsetCommand(ctx: CommandContext): void {
+  const key = ctx.argv[1]!;
+  const list = lookupWriteOfType(ctx, key, 'list');
+  if (list === null) throw new ReplyError(ERR.NO_SUCH_KEY);
+  const index = parseLong(ctx.argv[2]!);
+  if (!list.value.set(index, ctx.argv[3]!)) throw new ReplyError(ERR.INDEX_OUT_OF_RANGE);
+  ctx.db.signalModifiedKey(key);
+  ctx.reply.ok();
+}
+
+export function linsertCommand(ctx: CommandContext): void {
+  const where = ctx.argv[2]!.toUpperCase();
+  if (where !== 'BEFORE' && where !== 'AFTER') throw new ReplyError(ERR.SYNTAX);
+  const key = ctx.argv[1]!;
+  const list = lookupWriteOfType(ctx, key, 'list');
+  if (list === null) {
+    ctx.reply.integer(0);
+    return;
+  }
+  const at = list.value.indexOf(ctx.argv[3]!);
+  if (at === -1) {
+    ctx.reply.integer(-1);
+    return;
+  }
+  list.value.insert(where === 'BEFORE' ? at : at + 1, ctx.argv[4]!);
+  ctx.db.signalModifiedKey(key);
+  ctx.reply.integer(list.value.length);
+}
+
+export function lremCommand(ctx: CommandContext): void {
+  const count = parseLong(ctx.argv[2]!);
+  const key = ctx.argv[1]!;
+  const list = lookupWriteOfType(ctx, key, 'list');
+  if (list === null) {
+    ctx.reply.integer(0);
+    return;
+  }
+  const removed = list.value.remove(ctx.argv[3]!, count);
+  if (removed > 0) afterRemove(ctx, key, list);
+  ctx.reply.integer(removed);
+}
+
+export function ltrimCommand(ctx: CommandContext): void {
+  const start = parseLong(ctx.argv[2]!);
+  const end = parseLong(ctx.argv[3]!);
+  const key = ctx.argv[1]!;
+  const list = lookupWriteOfType(ctx, key, 'list');
+  if (list !== null) {
+    const len = list.value.length;
+    const r = normaliseRange(start, end, len);
+    if (r === null) list.value.clear();
+    else list.value.trim(r[0], r[1]);
+    if (list.value.length !== len) afterRemove(ctx, key, list);
+  }
+  ctx.reply.ok();
+}
+
+export function lmoveCommand(ctx: CommandContext): void {
+  const from = parseEnd(ctx.argv[3]!);
+  const to = parseEnd(ctx.argv[4]!);
+  const srcKey = ctx.argv[1]!;
+  const dstKey = ctx.argv[2]!;
+  const src = lookupWriteOfType(ctx, srcKey, 'list');
+  if (src === null) {
+    ctx.reply.nullBulk();
+    return;
+  }
+  // The destination's type is checked before anything is popped (rule 4).
+  lookupWriteOfType(ctx, dstKey, 'list');
+  const value = from === 'LEFT' ? src.value.popHead()! : src.value.popTail()!;
+  if (srcKey === dstKey) {
+    // A rotation: the list never empties, and the key is signalled once.
+    if (to === 'LEFT') src.value.pushHead(value);
+    else src.value.pushTail(value);
+    ctx.db.signalModifiedKey(srcKey);
+  } else {
+    afterRemove(ctx, srcKey, src);
+    const dst = listForPush(ctx, dstKey);
+    if (to === 'LEFT') dst.value.pushHead(value);
+    else dst.value.pushTail(value);
+    ctx.db.signalModifiedKey(dstKey);
+  }
+  ctx.reply.bulk(value);
+}
+
+export const listCommands: CommandSpec[] = [
+  command('lpush', -3, ['write', 'denyoom'], [1, 1, 1], lpushCommand),
+  command('rpush', -3, ['write', 'denyoom'], [1, 1, 1], rpushCommand),
+  command('lpop', -2, ['write'], [1, 1, 1], lpopCommand),
+  command('rpop', -2, ['write'], [1, 1, 1], rpopCommand),
+  command('llen', 2, ['readonly'], [1, 1, 1], llenCommand),
+  command('lrange', 4, ['readonly'], [1, 1, 1], lrangeCommand),
+  command('lindex', 3, ['readonly'], [1, 1, 1], lindexCommand),
+  command('lset', 4, ['write', 'denyoom'], [1, 1, 1], lsetCommand),
+  command('linsert', 5, ['write', 'denyoom'], [1, 1, 1], linsertCommand),
+  command('lrem', 4, ['write'], [1, 1, 1], lremCommand),
+  command('ltrim', 4, ['write'], [1, 1, 1], ltrimCommand),
+  command('lmove', 5, ['write', 'denyoom'], [1, 2, 1], lmoveCommand),
+];

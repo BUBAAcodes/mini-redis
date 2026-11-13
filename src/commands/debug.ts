@@ -8,8 +8,8 @@
  * and dict layout, so two servers with the same data agree even if they built it in a
  * different order (after a reload, on a replica). Keys that are already logically expired are
  * left out, so a primary that collected a key and a replica still waiting for its DEL agree
- * too. Each value is hashed in a canonical form; unordered collections will be sorted first as
- * their types arrive (steps 9 to 11). The digest is only comparable between MiniRedis servers.
+ * too. Each value is hashed in a canonical form: lists in order, and unordered collections
+ * sorted first (steps 10 and 11). The digest is only comparable between MiniRedis servers.
  *
  * DEBUG is one command with a switch, as in Redis, not a container with subcommand specs.
  *
@@ -17,6 +17,7 @@
  */
 import { createHash } from 'node:crypto';
 import type { Hash } from 'node:crypto';
+import { formatDouble } from '../protocol/encoder.js';
 import { ERR, ReplyError, unknownSubcommand } from '../protocol/errors.js';
 import type { Server } from '../server/server.js';
 import type { RObj } from '../storage/redis-object.js';
@@ -38,10 +39,44 @@ function hashValue(h: Hash, obj: RObj): void {
     case 'string':
       field(h, obj.value);
       break;
+    case 'list':
+      // In order: the order is part of a list's value.
+      field(h, String(obj.value.length));
+      obj.value.forEach((item) => field(h, item));
+      break;
+    case 'hash': {
+      // Sorted by field (byte order), so the dict's layout and history don't matter.
+      const pairs: Array<[string, string]> = [];
+      obj.value.forEach((f, v) => pairs.push([f, v]));
+      pairs.sort((a, b) => (a[0] < b[0] ? -1 : a[0] > b[0] ? 1 : 0));
+      field(h, String(pairs.length));
+      for (const [f, v] of pairs) {
+        field(h, f);
+        field(h, v);
+      }
+      break;
+    }
+    case 'set': {
+      const members: string[] = [];
+      obj.value.forEach((m) => members.push(m));
+      members.sort();
+      field(h, String(members.length));
+      for (const m of members) field(h, m);
+      break;
+    }
+    case 'zset': {
+      // In the set's own order (score, then member), which both sides compute identically.
+      field(h, String(obj.value.size));
+      for (let n = obj.value.zsl.first; n !== null; n = n.next) {
+        field(h, n.member);
+        field(h, formatDouble(n.score));
+      }
+      break;
+    }
     default: {
-      // Each new type (lists, hashes, sets, zsets) must add its canonical form here.
-      const unknown: never = obj.type;
-      throw new Error(`digest: no canonical form for type ${String(unknown)}`);
+      // Each new type must add its canonical form here; this stops compiling until it does.
+      const unknown: never = obj;
+      throw new Error(`digest: no canonical form for type ${(unknown as RObj).type}`);
     }
   }
 }

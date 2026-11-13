@@ -3,6 +3,8 @@ import {
   INT64_MAX,
   INT64_MIN,
   clampToSafe,
+  parseStrictDouble,
+  parseStrtodDouble,
   formatDouble,
   parseDouble,
   parseInt64,
@@ -77,5 +79,47 @@ describe('clampToSafe', () => {
     expect(clampToSafe(-5n)).toBe(-5);
     expect(clampToSafe(INT64_MAX)).toBe(Number.MAX_SAFE_INTEGER);
     expect(clampToSafe(INT64_MIN)).toBe(Number.MIN_SAFE_INTEGER);
+  });
+});
+
+describe('parseStrictDouble (getDoubleFromObject: ZADD, ZINCRBY, WEIGHTS)', () => {
+  it('accepts what Redis accepts, checked against redis:7.4', () => {
+    for (const [s, v] of [
+      ['1', 1],
+      ['+1', 1],
+      ['.5', 0.5],
+      ['5.', 5],
+      ['-2.5e3', -2500],
+      ['inf', Infinity],
+      ['-INF', -Infinity],
+      ['infinity', Infinity],
+      ['1e-310', 1e-310],
+      ['0e-400', 0],
+    ] as const) {
+      expect(parseStrictDouble(s), s).toBe(v);
+    }
+  });
+
+  it('refuses empty, spaces, nan, overflow and total underflow', () => {
+    for (const s of ['', ' 1', '1 ', 'nan', 'abc', '1e400', '-1e400', '1e-400', '1e', '0x10']) {
+      expect(parseStrictDouble(s), JSON.stringify(s)).toBeNull();
+    }
+  });
+});
+
+describe('parseStrtodDouble (zslParseRange bounds)', () => {
+  it('is plain strtod: empty is 0, leading space skipped, overflow and underflow allowed', () => {
+    expect(parseStrtodDouble('')).toBe(0);
+    expect(parseStrtodDouble(' 1')).toBe(1);
+    expect(parseStrtodDouble('1e400')).toBe(Infinity);
+    expect(parseStrtodDouble('-1e400')).toBe(-Infinity);
+    expect(parseStrtodDouble('1e-400')).toBe(0);
+    expect(parseStrtodDouble('+inf')).toBe(Infinity);
+  });
+
+  it('refuses trailing junk, whitespace alone and nan', () => {
+    for (const s of ['1 ', ' ', 'nan', 'x', '1x']) {
+      expect(parseStrtodDouble(s), JSON.stringify(s)).toBeNull();
+    }
   });
 });

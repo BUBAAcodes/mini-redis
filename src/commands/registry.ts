@@ -11,9 +11,13 @@
 import type { CommandTable } from './command.js';
 import { connectionCommands } from './connection.js';
 import { debugCommands } from './debug.js';
+import { hashCommands } from './hashes.js';
 import { keyCommands } from './keys.js';
+import { listCommands } from './lists.js';
 import { serverCommands } from './server.js';
+import { setCommands } from './sets.js';
 import { stringCommands } from './strings.js';
+import { zsetCommands } from './zsets.js';
 
 export function buildCommandTable(): CommandTable {
   const table: CommandTable = new Map();
@@ -21,6 +25,10 @@ export function buildCommandTable(): CommandTable {
     ...connectionCommands,
     ...stringCommands,
     ...keyCommands,
+    ...listCommands,
+    ...hashCommands,
+    ...setCommands,
+    ...zsetCommands,
     ...serverCommands,
     ...debugCommands,
   ]) {

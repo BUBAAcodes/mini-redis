@@ -153,7 +153,7 @@ export class Reply {
 const LL_SAFE = 4611686018427387904;
 
 /**
- * Formats a double exactly as Redis 7.4's d2string(): `inf`, `-inf`, `nan`; integral values
+ * Formats a double exactly as Redis 7.4's d2string(): `inf`, `-inf`, `nan`, `-0`; integral values
  * within ±2^62 as their exact integer; anything else through fpconv_dtoa's emit_digits rules,
  * fed with the shortest round-trip digits JS gives us.
  */
@@ -161,6 +161,8 @@ export function formatDouble(x: number): string {
   if (Number.isNaN(x)) return 'nan';
   if (x === Infinity) return 'inf';
   if (x === -Infinity) return '-inf';
+  // d2string keeps the sign of zero (ZINCRBY k -0 new replies "-0").
+  if (x === 0) return Object.is(x, -0) ? '-0' : '0';
   // BigInt, not String(): String(2 ** 62) is 4611686018427388000, Redis prints every digit.
   if (Number.isInteger(x) && x >= -LL_SAFE && x <= LL_SAFE) return BigInt(x).toString();
 

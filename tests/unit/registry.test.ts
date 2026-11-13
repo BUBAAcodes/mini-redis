@@ -14,7 +14,7 @@ const handlerName = (name: string): string =>
     .join('') + 'Command';
 
 describe('command table (spec 7.9)', () => {
-  it('has every command built so far (steps 5 to 7)', () => {
+  it('has every command built so far (steps 5 to 11)', () => {
     const names = [...buildCommandTable().keys()].sort();
     expect(names).toEqual(
       [
@@ -61,6 +61,67 @@ describe('command table (spec 7.9)', () => {
         'ttl',
         'type',
         'unlink',
+        // Lists (step 9).
+        'lindex',
+        'linsert',
+        'llen',
+        'lmove',
+        'lpop',
+        'lpush',
+        'lrange',
+        'lrem',
+        'lset',
+        'ltrim',
+        'rpop',
+        'rpush',
+        // Hashes and sets (step 10).
+        'hdel',
+        'hexists',
+        'hget',
+        'hgetall',
+        'hincrby',
+        'hincrbyfloat',
+        'hkeys',
+        'hlen',
+        'hmget',
+        'hscan',
+        'hset',
+        'hvals',
+        'sadd',
+        'scard',
+        'sdiff',
+        'sdiffstore',
+        'sinter',
+        'sinterstore',
+        'sismember',
+        'smembers',
+        'spop',
+        'srandmember',
+        'srem',
+        'sscan',
+        'sunion',
+        'sunionstore',
+        // Sorted sets (step 11).
+        'zadd',
+        'zcard',
+        'zcount',
+        'zincrby',
+        'zinterstore',
+        'zpopmax',
+        'zpopmin',
+        'zrange',
+        'zrangebylex',
+        'zrangebyscore',
+        'zrank',
+        'zrem',
+        'zremrangebyrank',
+        'zremrangebyscore',
+        'zrevrange',
+        'zrevrangebyscore',
+        'zrevrank',
+        'zscan',
+        'zscore',
+        'zunionstore',
       ].sort(),
     );
   });

@@ -25,8 +25,22 @@ export const ERR = {
   // getIntFromObjectOrReply's message for an int64 outside the int range (SELECT 2147483648).
   NOT_INT32: 'ERR value is out of range, value must between -2147483648 and 2147483647',
   NOT_FLOAT: 'ERR value is not a valid float',
+  NOT_POSITIVE: 'ERR value is out of range, must be positive',
   OVERFLOW: 'ERR increment or decrement would overflow',
   NAN_OR_INFINITY: 'ERR increment would produce NaN or Infinity',
+  VALUE_NAN_OR_INFINITY: 'ERR value is NaN or Infinity',
+  HASH_NOT_INTEGER: 'ERR hash value is not an integer',
+  HASH_NOT_FLOAT: 'ERR hash value is not a float',
+  ZADD_XX_NX: 'ERR XX and NX options at the same time are not compatible',
+  ZADD_GT_LT_NX: 'ERR GT, LT, and/or NX options at the same time are not compatible',
+  ZADD_INCR_PAIR: 'ERR INCR option supports a single increment-element pair',
+  SCORE_NAN: 'ERR resulting score is not a number (NaN)',
+  WEIGHT_NOT_FLOAT: 'ERR weight value is not a float',
+  ZRANGE_LIMIT:
+    'ERR syntax error, LIMIT is only supported in combination with either BYSCORE or BYLEX',
+  ZRANGE_WITHSCORES_BYLEX: 'ERR syntax error, WITHSCORES not supported in combination with BYLEX',
+  SRANDMEMBER_RANGE:
+    'ERR value is out of range, value must between -9223372036854775807 and 9223372036854775807',
   WRONGTYPE: 'WRONGTYPE Operation against a key holding the wrong kind of value',
   NO_SUCH_KEY: 'ERR no such key',
   INDEX_OUT_OF_RANGE: 'ERR index out of range',

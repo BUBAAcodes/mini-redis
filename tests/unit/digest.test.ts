@@ -1,7 +1,14 @@
 import { describe, expect, it } from 'vitest';
 import { datasetDigest, valueDigest } from '../../src/commands/debug.js';
 import { Server } from '../../src/server/server.js';
-import { createStringObject } from '../../src/storage/redis-object.js';
+import {
+  createHashObject,
+  createListObject,
+  createSetObject,
+  createStringObject,
+  createZsetObject,
+} from '../../src/storage/redis-object.js';
+import { Random } from '../../src/utils/random.js';
 
 const ZERO = '0'.repeat(40);
 const newServer = () => new Server({ log: () => {}, seed: 3 });
@@ -61,5 +68,87 @@ describe('DEBUG DIGEST (spec 8.9)', () => {
     expect(valueDigest(null)).toBe(ZERO);
     expect(valueDigest(createStringObject('x'))).toBe(valueDigest(createStringObject('x')));
     expect(valueDigest(createStringObject('x'))).not.toBe(valueDigest(createStringObject('y')));
+  });
+
+  describe('per type', () => {
+    const list = (items: string[], maxItems = 128) => {
+      const o = createListObject(maxItems);
+      for (const v of items) o.value.pushTail(v);
+      return o;
+    };
+
+    it('a list hashes its items in order, whatever its node layout', () => {
+      const items = Array.from({ length: 50 }, (_, i) => `v${i}`);
+      expect(valueDigest(list(items, 3))).toBe(valueDigest(list(items, 128)));
+      expect(valueDigest(list(['a', 'b']))).not.toBe(valueDigest(list(['b', 'a'])));
+      expect(valueDigest(list(['ab']))).not.toBe(valueDigest(list(['a', 'b'])));
+      expect(valueDigest(list(['a']))).not.toBe(valueDigest(createStringObject('a')));
+    });
+
+    const opts = (seed: number) => ({ seed, rng: new Random(seed) });
+    const hash = (pairs: Array<[string, string]>, seed = 1) => {
+      const o = createHashObject(opts(seed));
+      for (const [f, v] of pairs) o.value.set(f, v);
+      return o;
+    };
+    const set = (members: string[], seed = 1) => {
+      const o = createSetObject(opts(seed));
+      for (const m of members) o.value.set(m, true);
+      return o;
+    };
+
+    it('a hash is order-free but pairs fields with their values', () => {
+      const pairs = Array.from({ length: 100 }, (_, i): [string, string] => [`f${i}`, `v${i}`]);
+      expect(valueDigest(hash(pairs, 1))).toBe(valueDigest(hash([...pairs].reverse(), 99)));
+      expect(
+        valueDigest(
+          hash([
+            ['a', '1'],
+            ['b', '2'],
+          ]),
+        ),
+      ).not.toBe(
+        valueDigest(
+          hash([
+            ['a', '2'],
+            ['b', '1'],
+          ]),
+        ),
+      );
+    });
+
+    it('a set is order-free; a set, a hash and a list with the same strings differ', () => {
+      const ms = Array.from({ length: 100 }, (_, i) => `m${i}`);
+      expect(valueDigest(set(ms, 1))).toBe(valueDigest(set([...ms].reverse(), 7)));
+      expect(valueDigest(set(['a', 'b']))).not.toBe(valueDigest(set(['a', 'c'])));
+      expect(valueDigest(set(['a']))).not.toBe(valueDigest(list(['a'])));
+    });
+
+    const zset = (pairs: Array<[number, string]>, seed = 1) => {
+      const o = createZsetObject(opts(seed), new Random(seed));
+      for (const [sc, m] of pairs) o.value.add(m, sc);
+      return o;
+    };
+
+    it('a sorted set is insertion-order-free and depends on every score', () => {
+      const pairs = Array.from({ length: 100 }, (_, i): [number, string] => [i % 7, `m${i}`]);
+      expect(valueDigest(zset(pairs, 1))).toBe(valueDigest(zset([...pairs].reverse(), 5)));
+      expect(
+        valueDigest(
+          zset([
+            [1, 'a'],
+            [2, 'b'],
+          ]),
+        ),
+      ).not.toBe(
+        valueDigest(
+          zset([
+            [2, 'a'],
+            [1, 'b'],
+          ]),
+        ),
+      );
+      expect(valueDigest(zset([[1, 'a']]))).not.toBe(valueDigest(set(['a'])));
+    });
   });
 });
