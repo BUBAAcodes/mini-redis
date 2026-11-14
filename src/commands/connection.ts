@@ -1,17 +1,22 @@
 /**
- * Connection commands: PING, ECHO, QUIT, SELECT and CLIENT (ID, SETNAME, GETNAME, SETINFO).
- * HELLO, AUTH and the rest of CLIENT arrive in steps 22 and 23.
+ * Connection commands: PING, ECHO, QUIT, SELECT and CLIENT (ID, SETNAME, GETNAME, SETINFO,
+ * KILL). HELLO, AUTH and the rest of CLIENT arrive in steps 22 and 23.
  *
  * Key design choice: these only touch the calling client's own state, never the keyspace, so
  * none is a write and none propagates. QUIT doesn't close the socket itself: it sets
  * closeAfterReply, so its +OK goes out in the same beforeSleep write as every reply before it.
  *
+ * CLIENT KILL is the exception: it closes other connections, through Server.killClient. A
+ * client killing itself still gets its reply first (closeAfterReply), as in Redis.
+ *
  * Mirrors Redis server.c (pingCommand, echoCommand), db.c (selectCommand) and networking.c
- * (clientCommand, clientSetNameOrReply, clientSetinfoCommand).
+ * (clientCommand, clientSetNameOrReply, clientSetinfoCommand, clientKillCommand,
+ * getClientType, getClientTypeByName).
  */
 import { ERR, ReplyError, wrongArity } from '../protocol/errors.js';
 import { parseInt64 } from '../utils/numbers.js';
 import { inSubscriberMode } from '../pubsub/hub.js';
+import type { Client } from '../server/client.js';
 import { command, containerOnly } from './command.js';
 import type { CommandContext, CommandSpec } from './command.js';
 
@@ -87,6 +92,96 @@ export function clientSetinfoCommand(ctx: CommandContext): void {
   ctx.reply.ok();
 }
 
+/** The class a client counts as, for CLIENT KILL TYPE and the output limits (step 22). */
+export type ClientType = 'normal' | 'replica' | 'pubsub' | 'master';
+
+/** Redis's getClientType; `master` (the link to our primary) arrives with step 21. */
+export function clientType(client: Client): ClientType {
+  if (client.repl !== null) return 'replica';
+  if (client.channels.size + client.patterns.size > 0) return 'pubsub';
+  return 'normal';
+}
+
+const CLIENT_TYPES: Readonly<Record<string, ClientType>> = {
+  normal: 'normal',
+  replica: 'replica',
+  slave: 'replica',
+  pubsub: 'pubsub',
+  master: 'master',
+};
+
+/** Closes `target`; the caller itself gets its reply first. */
+function kill(ctx: CommandContext, target: Client): void {
+  if (target === ctx.client) target.closeAfterReply = true;
+  else ctx.server.killClient(target);
+}
+
+/**
+ * `CLIENT KILL ip:port` (the old form: +OK or an error), or `CLIENT KILL <filter> <value> …`
+ * with ID, ADDR, LADDR, TYPE and SKIPME (the caller is skipped unless SKIPME no): the number
+ * killed. Every filter is checked before any client is touched (rule 4).
+ */
+export function clientKillCommand(ctx: CommandContext): void {
+  const { argv, server } = ctx;
+  if (argv.length === 3) {
+    const target = [...server.clients.values()].find((c) => c.addr === argv[2]);
+    if (target === undefined) throw new ReplyError('ERR No such client');
+    kill(ctx, target);
+    ctx.reply.ok();
+    return;
+  }
+  if (argv.length % 2 !== 0) throw new ReplyError(ERR.SYNTAX);
+  let id: number | null = null;
+  let type: ClientType | null = null;
+  let addr: string | null = null;
+  let laddr: string | null = null;
+  let skipme = true;
+  for (let i = 2; i < argv.length; i += 2) {
+    const value = argv[i + 1]!;
+    switch (argv[i]!.toLowerCase()) {
+      case 'id': {
+        const n = parseInt64(value);
+        if (n === null || n <= 0n) throw new ReplyError('ERR client-id should be greater than 0');
+        id = Number(n);
+        break;
+      }
+      case 'type': {
+        const t = Object.hasOwn(CLIENT_TYPES, value.toLowerCase())
+          ? CLIENT_TYPES[value.toLowerCase()]!
+          : undefined;
+        if (t === undefined) throw new ReplyError(`ERR Unknown client type '${value}'`);
+        type = t;
+        break;
+      }
+      case 'addr':
+        addr = value;
+        break;
+      case 'laddr':
+        laddr = value;
+        break;
+      case 'skipme': {
+        const v = value.toLowerCase();
+        if (v !== 'yes' && v !== 'no') throw new ReplyError(ERR.SYNTAX);
+        skipme = v === 'yes';
+        break;
+      }
+      default:
+        throw new ReplyError(ERR.SYNTAX);
+    }
+  }
+  let killed = 0;
+  for (const c of [...server.clients.values()]) {
+    if (id !== null && c.id !== id) continue;
+    if (type !== null && clientType(c) !== type) continue;
+    if (addr !== null && c.addr !== addr) continue;
+    if (laddr !== null && c.laddr !== laddr) continue;
+    if (skipme && c === ctx.client) continue;
+    kill(ctx, c);
+    killed++;
+  }
+  ctx.reply.integer(killed);
+}
+
 export const connectionCommands: CommandSpec[] = [
   command('ping', -1, [], [0, 0, 0], pingCommand),
   command('echo', 2, [], [0, 0, 0], echoCommand),
@@ -97,5 +192,6 @@ export const connectionCommands: CommandSpec[] = [
     command('client|setname', 3, ['stale'], [0, 0, 0], clientSetnameCommand),
     command('client|getname', 2, ['stale'], [0, 0, 0], clientGetnameCommand),
     command('client|setinfo', 4, ['stale'], [0, 0, 0], clientSetinfoCommand),
+    command('client|kill', -3, ['admin', 'stale'], [0, 0, 0], clientKillCommand),
   ]),
 ];

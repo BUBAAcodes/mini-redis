@@ -13,19 +13,23 @@
  */
 import type { Client } from './client.js';
 
+/** What beforeSleep runs, in this order (spec 9.1 step 5), before the client replies. */
+export interface BeforeSleepHooks {
+  /** The input of clients unblocked this turn, so their replies join this flush. */
+  beforeWrites?: () => void;
+  /** `REPLCONF GETACK *` into the stream if a WAIT blocked this turn. */
+  requestAcks?: () => void;
+  /** The turn's AOF buffer to the OS (and its fsync under `always`). */
+  writeAof?: () => void;
+  /** The turn's stream bytes, and anything else queued, to the replicas. */
+  writeReplicas?: () => void;
+}
+
 export class EventLoop {
   private scheduled = false;
   private readonly pendingWrites = new Set<Client>();
 
-  /**
-   * `beforeWrites` runs first in every beforeSleep, before anything is written: the server
-   * runs the input of clients unblocked this turn there, so their replies join this flush.
-   * `writeAof` then hands the turn's AOF buffer to the OS (and fsyncs it under `always`).
-   */
-  constructor(
-    private readonly beforeWrites: () => void = () => {},
-    private readonly writeAof: () => void = () => {},
-  ) {}
+  constructor(private readonly hooks: BeforeSleepHooks = {}) {}
 
   scheduleBeforeSleep(): void {
     if (this.scheduled) return;
@@ -47,12 +51,15 @@ export class EventLoop {
   /** Also called directly at shutdown to flush what's queued. */
   beforeSleep(): void {
     this.scheduled = false;
+    const hooks = this.hooks;
     // Unblocked clients' pipelined input first (Redis's processUnblockedClients): it can queue
     // replies and propagation records, which the steps below then write.
-    this.beforeWrites();
-    // In this order: REPLCONF GETACK for WAIT (step 20), the AOF write and fsync, the
-    // replication stream (20). Replies only after the AOF (rule 8).
-    this.writeAof();
+    hooks.beforeWrites?.();
+    // Then REPLCONF GETACK for WAIT, the AOF write and fsync, the replication stream; replies
+    // only after the AOF (rule 8).
+    hooks.requestAcks?.();
+    hooks.writeAof?.();
+    hooks.writeReplicas?.();
     for (const client of this.pendingWrites) writeClient(client);
     this.pendingWrites.clear();
     // Output buffer limits (step 22) are enforced here.

@@ -172,6 +172,7 @@ export function call(
   const db = server.dbs[client.db]!;
   const ctx = new CommandContext(server, client, db, argv);
   const dirtyBefore = server.dirty;
+  const replOffsetBefore = server.repl.masterReplOffset;
   server.propagator.begin();
   // Read the clock once, so a key can't expire halfway through a command (spec 7.5).
   if (!options.inExec) server.cmdTime = Date.now();
@@ -201,6 +202,8 @@ export function call(
   // 10. Propagate: the command's own record only if it's a write that changed something.
   const changed = server.dirty > dirtyBefore && spec.flags.includes('write');
   server.propagator.end(db.id, argv, changed);
+  // WAIT waits for the offset right after the client's last command that propagated.
+  if (server.repl.masterReplOffset !== replOffsetBefore) client.woff = server.repl.masterReplOffset;
   // 11. Serve blocked clients whose keys became ready, after this command's record so each
   //    pop replays after the push that fed it, and after the whole EXEC rather than after
   //    each of its commands.

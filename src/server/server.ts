@@ -35,6 +35,7 @@ import { loadSnapshotFile, snapshotPath } from '../persistence/snapshot-format.j
 import type { SnapshotJob } from '../persistence/snapshot-job.js';
 import { ProtocolError } from '../protocol/errors.js';
 import { PubSubHub } from '../pubsub/hub.js';
+import { Replication } from '../replication/primary.js';
 import { Db } from '../storage/database.js';
 import { EvictionPool, isLfuPolicy, performEvictions } from '../storage/eviction.js';
 import { unwatchAllKeys } from '../storage/watch.js';
@@ -66,6 +67,10 @@ export interface Stats {
   evictedKeys: number;
   keyspaceHits: number;
   keyspaceMisses: number;
+  /** Full syncs served, and partial syncs accepted or refused (INFO stats, spec 9.13). */
+  syncFull: number;
+  syncPartialOk: number;
+  syncPartialErr: number;
 }
 
 const newStats = (): Stats => ({
@@ -76,6 +81,9 @@ const newStats = (): Stats => ({
   evictedKeys: 0,
   keyspaceHits: 0,
   keyspaceMisses: 0,
+  syncFull: 0,
+  syncPartialOk: 0,
+  syncPartialErr: 0,
 });
 
 export interface CommandStats {
@@ -91,11 +99,15 @@ export class Server {
   readonly dbs: Db[];
   readonly clients = new Map<number, Client>();
   readonly commands: CommandTable = buildCommandTable();
-  readonly eventLoop = new EventLoop(
-    () => this.processUnblockedClients(),
-    () => this.aof?.flush(),
-  );
+  readonly eventLoop = new EventLoop({
+    beforeWrites: () => this.processUnblockedClients(),
+    requestAcks: () => this.repl.requestAcks(),
+    writeAof: () => this.aof?.flush(),
+    writeReplicas: () => this.repl.writeReplicas(),
+  });
   readonly propagator = new Propagator(() => this.eventLoop.scheduleBeforeSleep());
+  /** Replication ID and offset, the backlog, the replicas and WAIT (spec 9.13). */
+  readonly repl: Replication = new Replication(this);
   readonly cron: Cron;
   /** Channels and patterns (spec 9.11); a frame goes onto the client's output queue. */
   readonly pubsub = new PubSubHub<Client>((client, frame) => {
@@ -197,6 +209,7 @@ export class Server {
       if (names.includes('maxmemory') || names.includes('maxmemory-policy')) {
         this.scheduleEviction();
       }
+      if (names.includes('repl-backlog-size')) this.repl.resizeBacklog();
       if (names.includes('appendonly')) {
         // As Redis's updateAppendonly: act only when the state really changes.
         const on = this.config.get('appendonly');
@@ -301,6 +314,15 @@ export class Server {
     aof?.close();
   }
 
+  /**
+   * Closes a client now (CLIENT KILL, output limits, replica timeouts): it leaves every
+   * registry at once and its socket is destroyed, so nothing more reaches it.
+   */
+  killClient(client: Client): void {
+    this.freeClient(client);
+    client.socket?.destroy();
+  }
+
   /** Queues a client for the next beforeSleep: it has replies (or a close) waiting. */
   queueReply(client: Client): void {
     this.eventLoop.queueClient(client);
@@ -390,6 +412,16 @@ export class Server {
         const cmd = client.parser.next();
         if (cmd === null) break;
         if (cmd.argv.length > 0) dispatch(this, client, cmd.argv);
+        // A replica's commands (REPLCONF ACK) never reply; one that did is misbehaving, and the
+        // reply can't go into its stream, so it's dropped, as Redis does.
+        if (client.repl !== null && client.reply.pendingBytes > 0) {
+          this.log.warning(
+            `Replica generated a reply to command '${client.lastCommand || cmd.argv[0]!.toLowerCase()}', disconnecting it: ${client.describe()}`,
+          );
+          client.reply.take();
+          this.killClient(client);
+          return;
+        }
       }
     } catch (e) {
       if (!(e instanceof ProtocolError)) throw e;
@@ -421,6 +453,8 @@ export class Server {
   }
 
   private freeClient(client: Client): void {
+    // Once only: a killed client's socket still emits 'close' afterwards.
+    if (this.clients.get(client.id) !== client) return;
     client.closed = true;
     this.clients.delete(client.id);
     this.eventLoop.forget(client);
@@ -430,5 +464,6 @@ export class Server {
     this.pubsub.unsubscribeAll(client);
     this.waiters.unblock(client);
     this.unblockedClients.delete(client);
+    this.repl.freeClient(client);
   }
 }

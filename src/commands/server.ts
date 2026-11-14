@@ -192,9 +192,9 @@ export function infoCommand(ctx: CommandContext): void {
 }
 
 /**
- * SAVE blocks the server by design (spec 8.9). Refused while a BGSAVE runs; beside an AOF
- * rewrite it runs, as in Redis 7.4 (checked against the reference), since writing the dataset
- * changes nothing the rewrite is copying.
+ * SAVE blocks the server by design (spec 8.9). Refused while a BGSAVE or a full sync runs (both
+ * are RDB children to Redis); beside an AOF rewrite it runs, as in Redis 7.4 (checked against
+ * the reference), since writing the dataset changes nothing the rewrite is copying.
  */
 export function saveCommand(ctx: CommandContext): void {
   const job = ctx.server.snapshotJob;
@@ -210,7 +210,8 @@ export function bgsaveCommand(ctx: CommandContext): void {
     throw new ReplyError(ERR.SYNTAX);
   }
   const job = server.snapshotJob;
-  if (job !== null && job.kind === 'bgsave') throw new ReplyError(ERR.BGSAVE_IN_PROGRESS);
+  // A full sync is an RDB child to Redis too: "already in progress".
+  if (job !== null && job.kind !== 'rewrite') throw new ReplyError(ERR.BGSAVE_IN_PROGRESS);
   // Another job (an AOF rewrite) runs, or we're inside EXEC (`multi` stays set while the queue
   // runs), as Redis's server.in_exec: a job started now would see the transaction half done.
   // Either way serverCron starts the BGSAVE afterwards; with another job, only if asked.

@@ -15,6 +15,7 @@ import { hashCommands } from './hashes.js';
 import { keyCommands } from './keys.js';
 import { listCommands } from './lists.js';
 import { pubsubCommands } from './pubsub.js';
+import { replicationCommands } from './replication.js';
 import { serverCommands } from './server.js';
 import { setCommands } from './sets.js';
 import { stringCommands } from './strings.js';
@@ -34,6 +35,7 @@ export function buildCommandTable(): CommandTable {
     ...transactionCommands,
     ...pubsubCommands,
     ...serverCommands,
+    ...replicationCommands,
     ...debugCommands,
   ]) {
     if (table.has(spec.name)) throw new Error(`duplicate command '${spec.name}'`);

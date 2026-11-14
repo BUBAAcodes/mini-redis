@@ -5,8 +5,8 @@
  * Key design choice: each section is a function from the Server to its fields, listed in
  * Redis's order, so `INFO a b` and `INFO all` share one code path and print sections in the
  * same order whatever order they were asked for. Step 5 has the fields ioredis and the tests
- * need (`loading:0` is how ioredis knows the server is ready); step 23 fills in the rest of
- * section 13.1.
+ * need (`loading:0` is how ioredis knows the server is ready); later steps add theirs (memory,
+ * persistence, stats, replication), and step 23 fills in the rest of section 13.1.
  *
  * Mirrors Redis server.c (genRedisInfoString, infoCommand).
  */
@@ -67,7 +67,11 @@ const SECTIONS: ReadonlyArray<
     (s) => [
       ['loading', 0],
       ['rdb_changes_since_last_save', s.dirty],
-      ['rdb_bgsave_in_progress', s.snapshotJob?.kind === 'bgsave' ? 1 : 0],
+      // A full sync is a BGSAVE to Redis too (its fork writes an RDB).
+      [
+        'rdb_bgsave_in_progress',
+        s.snapshotJob !== null && s.snapshotJob.kind !== 'rewrite' ? 1 : 0,
+      ],
       ['rdb_last_save_time', s.lastSave],
       ['rdb_last_bgsave_status', s.lastBgsaveStatus],
       ['aof_enabled', s.aofState === 'off' ? 0 : 1],
@@ -84,6 +88,24 @@ const SECTIONS: ReadonlyArray<
           ]) satisfies Fields),
     ],
   ],
+  [
+    'stats',
+    'Stats',
+    // The counters that exist so far, in Redis's order; step 23 fills in the rest.
+    (s) => [
+      ['total_connections_received', s.stats.totalConnectionsReceived],
+      ['total_commands_processed', s.stats.totalCommandsProcessed],
+      ['rejected_connections', s.stats.rejectedConnections],
+      ['sync_full', s.stats.syncFull],
+      ['sync_partial_ok', s.stats.syncPartialOk],
+      ['sync_partial_err', s.stats.syncPartialErr],
+      ['expired_keys', s.stats.expiredKeys],
+      ['evicted_keys', s.stats.evictedKeys],
+      ['keyspace_hits', s.stats.keyspaceHits],
+      ['keyspace_misses', s.stats.keyspaceMisses],
+    ],
+  ],
+  ['replication', 'Replication', (s) => s.repl.infoFields()],
 ];
 
 /** Words that select every section; Redis's `default` set equals `all` until we have more. */

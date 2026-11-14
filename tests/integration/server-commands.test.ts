@@ -164,7 +164,8 @@ describe('INFO', () => {
     expect(info).toContain('\r\n\r\n# Persistence\r\nloading:0\r\n');
     expect(info).toContain('\r\nrdb_last_bgsave_status:ok\r\n');
     // Step 14's AOF fields close the section; the sizes only appear with the AOF on.
-    expect(info).toMatch(/\r\naof_enabled:0\r\n.*\r\naof_rewrites:0\r\n$/s);
+    expect(info).toMatch(/\r\naof_enabled:0\r\n.*\r\naof_rewrites:0\r\n\r\n# Stats\r\n/s);
+    expect(info).toMatch(/\r\n\r\n# Replication\r\nrole:master\r\n.*repl_backlog_histlen:0\r\n$/s);
     expect(info).not.toContain('aof_current_size');
   });
 
@@ -175,7 +176,17 @@ describe('INFO', () => {
     const both = (await c.call('INFO', 'persistence', 'server')) as string;
     expect(both.indexOf('# Server')).toBeLessThan(both.indexOf('# Persistence'));
     expect(await c.raw('INFO', 'nosuch')).toBe('$0\r\n\r\n');
-    expect(await c.call('INFO', 'everything')).toEqual(await c.call('INFO'));
+    // The same sections, in the same order (the counters move between the two calls).
+    const headers = async (...args: string[]) =>
+      String(await c.call('INFO', ...args)).match(/^# .*$/gm);
+    expect(await headers('everything')).toEqual(await headers());
+    expect(await headers()).toEqual([
+      '# Server',
+      '# Memory',
+      '# Persistence',
+      '# Stats',
+      '# Replication',
+    ]);
   });
 
   it('works for a raw error check too', async () => {

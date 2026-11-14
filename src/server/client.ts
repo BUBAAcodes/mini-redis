@@ -5,7 +5,8 @@
  * Key design choice: the output queue is the client's `Reply`. Handlers append to it, and only
  * beforeSleep turns it into socket writes, once per event-loop turn. So a pipeline of a
  * thousand commands that arrived in one chunk leaves in one write, and replies stay in the
- * order the commands came in (rule 12). Later steps add the monitor and replica fields here.
+ * order the commands came in (rule 12). A replica (step 20) is a client that sent PSYNC: its
+ * `repl` link holds its state and its own output queue, since it never gets ordinary replies.
  *
  * The AOF loader runs its commands on a client with no socket (Redis's fake client,
  * CLIENT_ID_AOF): it is never registered with the server, its replies are thrown away, and it
@@ -20,6 +21,7 @@ import { Reply } from '../protocol/encoder.js';
 import type { RespVersion } from '../protocol/encoder.js';
 import { RespParser } from '../protocol/parser.js';
 import type { ParserLimits } from '../protocol/parser.js';
+import type { ReplicaLink, WaitState } from '../replication/primary.js';
 import type { WatchedKey } from '../storage/watch.js';
 
 /** A command waiting for EXEC: already looked up and checked, so EXEC only has to run it. */
@@ -67,6 +69,18 @@ export class Client {
 
   /** What a blocked BLPOP, BRPOP or BLMOVE waits for; the keys' FIFOs are in its Db. */
   bstate: BlockState | null = null;
+  /** What a blocked WAIT waits for (spec 9.13). */
+  bwait: WaitState | null = null;
+
+  /** The replication offset after this client's last command that propagated, for WAIT. */
+  woff = 0;
+  /** REPLCONF listening-port and capa psync2, sent before PSYNC. */
+  replListeningPort = 0;
+  replCapaPsync2 = false;
+  /** Set by PSYNC: this connection is a replica (spec 9.2). */
+  repl: ReplicaLink | null = null;
+  /** When its output first passed its class's soft limit; 0 while under it. */
+  softLimitSince = 0;
 
   /** `socket` is null only for the AOF loader's client. */
   constructor(
@@ -96,9 +110,9 @@ export class Client {
     return this.reply.resp;
   }
 
-  /** Parked by a blocking command: its later input waits in the parser (spec 9.2). */
+  /** Parked by a blocking command or WAIT: its later input waits in the parser (spec 9.2). */
   get blocked(): boolean {
-    return this.bstate !== null;
+    return this.bstate !== null || this.bwait !== null;
   }
 
   /** For log lines about one client, like Redis's catClientInfoString (shortened). */

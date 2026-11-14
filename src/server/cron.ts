@@ -6,8 +6,10 @@
  * gets a small time budget so cron never becomes a long pause (rule 10). For now it refreshes
  * the LRU clock, expires keys, rehashes, evicts while over `maxmemory` and records the memory
  * peak, runs the AOF's retries and `everysec` fsync, starts scheduled and automatic AOF
- * rewrites, and starts BGSAVEs for save points; timeouts and output limits (22), replication
- * (20–21) and ops/sec sampling (23) join later.
+ * rewrites, starts BGSAVEs for save points, and runs the primary's replication chores (full
+ * syncs waiting for a job, heartbeats, keepalives, replica timeouts and output limits). Client
+ * timeouts and other output limits (22), the replica link (21) and ops/sec sampling (23) join
+ * later.
  *
  * Mirrors Redis server.c (serverCron, databasesCron).
  */
@@ -71,5 +73,7 @@ export class Cron {
     aofRewriteCron(this.server);
     // Save points and a scheduled BGSAVE (spec 9.8).
     snapshotCron(this.server);
+    // A full sync that waited for a job, then the once-a-second chores (spec 9.13).
+    this.server.repl.cron();
   }
 }

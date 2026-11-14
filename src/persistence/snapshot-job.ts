@@ -2,7 +2,7 @@
  * The copy-on-write snapshot engine (spec 9.8, ADR 0010): one job at a time walks the keyspace
  * in small time slices while clients keep writing, and still produces the dataset exactly as it
  * was when the job started (rule 9). BGSAVE and save points drive it here; the AOF rewrite
- * (aof-rewrite.ts) and a replica's full sync (step 20) plug in their own sinks.
+ * (aof-rewrite.ts) and a replica's full sync (replication/primary.ts) plug in their own sinks.
  *
  * Key design choice: Node can't fork(), so the point-in-time copy is made in code. Each job has
  * an epoch. Db calls `save()` before it changes or removes a key, and a key whose object isn't
@@ -43,7 +43,7 @@ const BACKLOG_RETRY_MS = 1;
 /** After a failed BGSAVE, save points wait this long before trying again (spec 9.8). */
 export const BGSAVE_RETRY_MS = 5000;
 
-/** Where a job's keys go: a file, a command file (an AOF rewrite), or memory (step 20). */
+/** Where a job's keys go: a file, a command file (an AOF rewrite), or memory (a full sync). */
 export interface SnapshotSink {
   /** One key as it was when the job started; `expireAt` is -1 for none. */
   write(db: number, key: string, obj: RObj, expireAt: number): void;
@@ -81,6 +81,8 @@ export class SnapshotJob {
   readonly startedAt = Date.now();
   /** `server.dirty` at the start: a BGSAVE that succeeds saved these changes (spec 9.8). */
   readonly dirtyAtStart: number;
+  /** The replication offset at the start: a full sync's snapshot is the stream up to here. */
+  readonly replOffset: number;
   /** Keys written so far, by the walk and by the hook. */
   keysWritten = 0;
   /** Of those, keys the hook saved just before they changed. */
@@ -117,6 +119,7 @@ export class SnapshotJob {
     if (server.snapshotJob !== null) throw new Error('SnapshotJob: another job is running');
     this.epoch = ++server.snapshotEpoch;
     this.dirtyAtStart = server.dirty;
+    this.replOffset = server.repl.masterReplOffset;
     this.sliceMs = options.sliceMs ?? SLICE_MS;
     this.onAbort = options.onAbort;
     server.snapshotJob = this;
@@ -370,7 +373,7 @@ export class FileSnapshotSink implements SnapshotSink {
   }
 }
 
-/** The binary format into memory: tests now, a replica's full sync in step 20. */
+/** The binary format into memory: a replica's full sync (spec 9.8, Sink table). */
 export class MemorySnapshotSink implements SnapshotSink {
   readonly error = null;
   readonly backlogged = false;
