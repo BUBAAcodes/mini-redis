@@ -9,17 +9,17 @@
  * one write per client.
  *
  * Startup follows spec 9.9: create `dir` and delete jobs' leftover temp files; then, with
- * `appendonly yes`, replay the AOF and open it for appending, or else load `dump.mrdb`. All of
- * it happens before the listener opens, so no client ever sees a half-loaded dataset. A damaged
- * AOF or snapshot makes start() reject; it never starts empty over good data. (With
- * `appendonly yes`, no AOF and a snapshot, spec 9.9 loads the snapshot and then rewrites the
- * AOF; that needs the rewrite, so it arrives with step 14.)
+ * `appendonly yes`, replay the AOF and open it for appending, or else load `dump.mrdb`. With
+ * `appendonly yes`, no AOF and a snapshot, the snapshot is loaded and a rewrite turns it into
+ * the AOF (aof-rewrite.ts). All of it happens before the listener opens, so no client ever sees
+ * a half-loaded dataset. A damaged AOF or snapshot makes start() reject; it never starts empty
+ * over good data.
  *
  * Mirrors Redis server.c (initServer, the redisServer struct) and networking.c
  * (acceptTcpHandler, readQueryFromClient, processInputBuffer, freeClient).
  */
 import { randomBytes } from 'node:crypto';
-import { mkdirSync } from 'node:fs';
+import { existsSync, mkdirSync } from 'node:fs';
 import net from 'node:net';
 import type { Socket } from 'node:net';
 import { Waiters } from '../blocking/waiters.js';
@@ -29,6 +29,7 @@ import { buildCommandTable } from '../commands/registry.js';
 import { Config } from '../config.js';
 import type { DictOptions } from '../datastructures/dict.js';
 import { Aof, aofPath, loadAof } from '../persistence/aof.js';
+import { startAppendOnly, stopAppendOnly } from '../persistence/aof-rewrite.js';
 import { removeLeftoverTemps } from '../persistence/files.js';
 import { loadSnapshotFile, snapshotPath } from '../persistence/snapshot-format.js';
 import type { SnapshotJob } from '../persistence/snapshot-job.js';
@@ -121,11 +122,24 @@ export class Server {
   activeExpireEnabled = true;
   /** The db the next active-expiry cycle starts at (spec 9.3: resume where it stopped). */
   activeExpireDb = 0;
-  /** The open AOF while `appendonly yes`, else null. */
+  /** The open AOF while `appendonly yes`, else null (also while waiting for the first rewrite). */
   aof: Aof | null = null;
+  /**
+   * Redis's aof_state: `wait-rewrite` while the AOF is being turned on, when no AOF is written
+   * until a rewrite has produced one holding the whole dataset.
+   */
+  aofState: 'off' | 'on' | 'wait-rewrite' = 'off';
+  /** A BGREWRITEAOF that had to wait for another job (or an EXEC); serverCron starts it. */
+  aofRewriteScheduled = false;
+  /** INFO's aof_last_bgrewrite_status. */
+  aofLastRewriteStatus: 'ok' | 'err' = 'ok';
+  /** Rewrites started since startup (INFO's aof_rewrites). */
+  aofRewrites = 0;
+  /** Unix ms of the last rewrite attempt: after a failure, serverCron waits 5 s. */
+  lastAofRewriteTry = 0;
   /** True while the AOF is replayed: nothing expires, propagates or counts in the stats. */
   loading = false;
-  /** The one running snapshot job (BGSAVE; AOF rewrite and full sync later), or null (9.8). */
+  /** The one running snapshot job (BGSAVE or AOF rewrite; full sync later), or null (9.8). */
   snapshotJob: SnapshotJob | null = null;
   /** Bumped by each job; an object stamped with the running job's epoch is already saved. */
   snapshotEpoch = 0;
@@ -160,6 +174,12 @@ export class Server {
     this.cron = new Cron(this);
     this.config.onChange((names) => {
       if (names.includes('hz') && this.cron.running) this.cron.start();
+      if (names.includes('appendonly')) {
+        // As Redis's updateAppendonly: act only when the state really changes.
+        const on = this.config.get('appendonly');
+        if (on && this.aofState === 'off') startAppendOnly(this);
+        else if (!on && this.aofState !== 'off') stopAppendOnly(this);
+      }
     });
   }
 
@@ -173,8 +193,11 @@ export class Server {
     for (const name of removeLeftoverTemps(dir)) {
       this.log.notice(`Removed leftover temp file ${name}`);
     }
-    if (this.config.get('appendonly')) this.openAof();
-    else loadSnapshotFile(this, snapshotPath(this));
+    if (!this.config.get('appendonly')) loadSnapshotFile(this, snapshotPath(this));
+    else if (!existsSync(aofPath(this)) && loadSnapshotFile(this, snapshotPath(this)) !== null) {
+      // Spec 9.9 step 2: the snapshot's data must reach the AOF before an AOF exists.
+      startAppendOnly(this);
+    } else this.openAof();
     const listener = net.createServer((socket) => this.accept(socket));
     this.listener = listener;
     await new Promise<void>((resolve, reject) => {
@@ -234,14 +257,23 @@ export class Server {
   private openAof(): void {
     const path = aofPath(this);
     loadAof(this, path);
-    this.aof = new Aof(this, path);
-    this.detachAof = this.propagator.attach(this.aof);
+    this.setAof(new Aof(this, path));
+    this.aofState = 'on';
   }
 
-  private closeAof(): void {
+  /** Makes `aof` the open AOF and a propagation sink, or leaves none. The old one isn't closed. */
+  setAof(aof: Aof | null): void {
     this.detachAof?.();
     this.detachAof = null;
-    this.aof?.close();
+    this.aof = aof;
+    if (aof !== null) this.detachAof = this.propagator.attach(aof);
+  }
+
+  /** Detaches the AOF, then writes, fsyncs and closes it (spec 9.14 step 2). */
+  closeAof(): void {
+    const aof = this.aof;
+    this.setAof(null);
+    aof?.close();
   }
 
   /** Queues a client for the next beforeSleep: it has replies (or a close) waiting. */

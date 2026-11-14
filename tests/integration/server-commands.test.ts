@@ -162,7 +162,10 @@ describe('INFO', () => {
     expect(info).toContain(`\r\ntcp_port:${t.port}\r\n`);
     expect(info).toMatch(/\r\nuptime_in_seconds:\d+\r\n/);
     expect(info).toContain('\r\n\r\n# Persistence\r\nloading:0\r\n');
-    expect(info).toMatch(/\r\nrdb_last_bgsave_status:ok\r\n$/);
+    expect(info).toContain('\r\nrdb_last_bgsave_status:ok\r\n');
+    // Step 14's AOF fields close the section; the sizes only appear with the AOF on.
+    expect(info).toMatch(/\r\naof_enabled:0\r\n.*\r\naof_rewrites:0\r\n$/s);
+    expect(info).not.toContain('aof_current_size');
   });
 
   it('selects sections, case-insensitively, in Redis order', async () => {

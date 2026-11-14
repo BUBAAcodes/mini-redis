@@ -50,6 +50,15 @@ export function encodeCommand(argv: readonly string[]): string {
   return out;
 }
 
+/**
+ * A propagated record as AOF text, with SELECT first when its db differs from `lastDb` (-1
+ * forces one). The AOF and the rewrite buffer both write records this way.
+ */
+export function encodeRecord(record: PropagationRecord, lastDb: number): string {
+  const cmd = encodeCommand(record.argv);
+  return record.db === lastDb ? cmd : encodeCommand(['SELECT', String(record.db)]) + cmd;
+}
+
 /** Where the AOF lives: `dir/appendfilename`. */
 export const aofPath = (server: Server): string =>
   join(server.config.get('dir'), server.config.get('appendfilename'));
@@ -57,6 +66,8 @@ export const aofPath = (server: Server): string =>
 export class Aof implements PropagationSink {
   /** Bytes in the file, as far as this process has written them. */
   size: number;
+  /** The size after loading or the last rewrite: auto-rewrite measures growth from it. */
+  baseSize: number;
   private readonly fd: number;
   /** Records waiting for the next flush, as latin1 bytes. */
   private buf = '';
@@ -77,6 +88,7 @@ export class Aof implements PropagationSink {
   ) {
     this.fd = fs.openSync(path, 'a');
     this.size = fs.fstatSync(this.fd).size;
+    this.baseSize = this.size;
     this.fsyncedSize = this.size;
   }
 
@@ -96,11 +108,8 @@ export class Aof implements PropagationSink {
   append(record: PropagationRecord): void {
     // PUBLISH goes to replicas only: the AOF stores data, not messages (spec 9.5).
     if (record.replicasOnly) return;
-    if (record.db !== this.lastDb) {
-      this.buf += encodeCommand(['SELECT', String(record.db)]);
-      this.lastDb = record.db;
-    }
-    this.buf += encodeCommand(record.argv);
+    this.buf += encodeRecord(record, this.lastDb);
+    this.lastDb = record.db;
   }
 
   /** beforeSleep: hands the buffer to the OS, then fsyncs it under `always`, before any reply. */
@@ -323,6 +332,9 @@ export function loadAof(server: Server, path: string): LoadResult {
  * false if the file is missing or damaged; the data is then whatever loaded before the damage.
  */
 export function reloadAof(server: Server): boolean {
+  // The data is about to be replaced without propagation: a job's point in time is gone. An
+  // aborted rewrite schedules itself again.
+  server.snapshotJob?.abort('DEBUG LOADAOF');
   server.aof?.flush();
   for (const db of server.dbs) db.flush();
   const path = aofPath(server);

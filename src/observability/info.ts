@@ -38,6 +38,18 @@ const SECTIONS: ReadonlyArray<
       ['rdb_bgsave_in_progress', s.snapshotJob?.kind === 'bgsave' ? 1 : 0],
       ['rdb_last_save_time', s.lastSave],
       ['rdb_last_bgsave_status', s.lastBgsaveStatus],
+      ['aof_enabled', s.aofState === 'off' ? 0 : 1],
+      ['aof_rewrite_in_progress', s.snapshotJob?.kind === 'rewrite' ? 1 : 0],
+      ['aof_rewrite_scheduled', s.aofRewriteScheduled ? 1 : 0],
+      ['aof_last_bgrewrite_status', s.aofLastRewriteStatus],
+      ['aof_rewrites', s.aofRewrites],
+      // Only while an AOF is open, as Redis prints them only with the AOF on.
+      ...((s.aof === null
+        ? []
+        : [
+            ['aof_current_size', s.aof.size],
+            ['aof_base_size', s.aof.baseSize],
+          ]) satisfies Fields),
     ],
   ],
 ];

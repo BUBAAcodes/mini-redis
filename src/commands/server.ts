@@ -15,6 +15,7 @@
 import type { Reply } from '../protocol/encoder.js';
 import { genInfoString } from '../observability/info.js';
 import { saveSnapshot } from '../persistence/snapshot-format.js';
+import { startAofRewrite } from '../persistence/aof-rewrite.js';
 import { startBgsave } from '../persistence/snapshot-job.js';
 import { ERR, ReplyError } from '../protocol/errors.js';
 import { command, containerOnly, lookupSubcommand } from './command.js';
@@ -182,9 +183,14 @@ export function infoCommand(ctx: CommandContext): void {
   ctx.reply.verbatim(genInfoString(ctx.server, ctx.argv.slice(1)));
 }
 
-/** SAVE blocks the server by design (spec 8.9); refused while a job runs (spec 9.8). */
+/**
+ * SAVE blocks the server by design (spec 8.9). Refused while a BGSAVE runs; beside an AOF
+ * rewrite it runs, as in Redis 7.4 (checked against the reference), since writing the dataset
+ * changes nothing the rewrite is copying.
+ */
 export function saveCommand(ctx: CommandContext): void {
-  if (ctx.server.snapshotJob !== null) throw new ReplyError(ERR.BGSAVE_IN_PROGRESS);
+  const job = ctx.server.snapshotJob;
+  if (job !== null && job.kind !== 'rewrite') throw new ReplyError(ERR.BGSAVE_IN_PROGRESS);
   if (!saveSnapshot(ctx.server)) throw new ReplyError(ERR.BARE);
   ctx.reply.ok();
 }
@@ -192,20 +198,38 @@ export function saveCommand(ctx: CommandContext): void {
 /** `BGSAVE [SCHEDULE]`. Replies are Redis 7.4's, checked against the reference. */
 export function bgsaveCommand(ctx: CommandContext): void {
   const { server, argv } = ctx;
-  // SCHEDULE only matters once an AOF rewrite can be running (step 14); it's accepted now.
   if (argv.length > 2 || (argv.length === 2 && argv[1]!.toLowerCase() !== 'schedule')) {
     throw new ReplyError(ERR.SYNTAX);
   }
-  if (server.snapshotJob !== null) throw new ReplyError(ERR.BGSAVE_IN_PROGRESS);
-  // Inside EXEC (`multi` stays set while the queue runs), as Redis's server.in_exec: a job
-  // started now would see the transaction half done, so serverCron starts it afterwards.
-  if (ctx.client.multi) {
+  const job = server.snapshotJob;
+  if (job !== null && job.kind === 'bgsave') throw new ReplyError(ERR.BGSAVE_IN_PROGRESS);
+  // Another job (an AOF rewrite) runs, or we're inside EXEC (`multi` stays set while the queue
+  // runs), as Redis's server.in_exec: a job started now would see the transaction half done.
+  // Either way serverCron starts the BGSAVE afterwards; with another job, only if asked.
+  if (job !== null || ctx.client.multi) {
+    if (argv.length === 1 && !ctx.client.multi) throw new ReplyError(ERR.BGSAVE_OTHER_JOB);
     server.bgsaveScheduled = true;
     ctx.reply.simple('Background saving scheduled');
     return;
   }
   if (!startBgsave(server)) throw new ReplyError(ERR.BARE);
   ctx.reply.simple('Background saving started');
+}
+
+/** BGREWRITEAOF (spec 9.7). Replies are Redis 7.4's, checked against the reference. */
+export function bgrewriteaofCommand(ctx: CommandContext): void {
+  const server = ctx.server;
+  const job = server.snapshotJob;
+  if (job !== null && job.kind === 'rewrite') throw new ReplyError(ERR.AOF_REWRITE_IN_PROGRESS);
+  if (job !== null || ctx.client.multi) {
+    server.aofRewriteScheduled = true;
+    // Asked for by hand: no pause after an earlier failure (Redis resets its failure count).
+    server.lastAofRewriteTry = 0;
+    ctx.reply.simple('Background append only file rewriting scheduled');
+    return;
+  }
+  if (!startAofRewrite(server)) throw new ReplyError(ERR.AOF_REWRITE_FAILED);
+  ctx.reply.simple('Background append only file rewriting started');
 }
 
 export function lastsaveCommand(ctx: CommandContext): void {
@@ -227,5 +251,6 @@ export const serverCommands: CommandSpec[] = [
   command('info', -1, ['stale'], [0, 0, 0], infoCommand),
   command('save', 1, ['admin', 'nomulti'], [0, 0, 0], saveCommand),
   command('bgsave', -1, ['admin'], [0, 0, 0], bgsaveCommand),
+  command('bgrewriteaof', 1, ['admin'], [0, 0, 0], bgrewriteaofCommand),
   command('lastsave', 1, ['stale'], [0, 0, 0], lastsaveCommand),
 ];

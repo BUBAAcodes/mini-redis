@@ -2,7 +2,7 @@
  * The copy-on-write snapshot engine (spec 9.8, ADR 0010): one job at a time walks the keyspace
  * in small time slices while clients keep writing, and still produces the dataset exactly as it
  * was when the job started (rule 9). BGSAVE and save points drive it here; the AOF rewrite
- * (step 14) and a replica's full sync (step 20) plug in their own sinks.
+ * (aof-rewrite.ts) and a replica's full sync (step 20) plug in their own sinks.
  *
  * Key design choice: Node can't fork(), so the point-in-time copy is made in code. Each job has
  * an epoch. Db calls `save()` before it changes or removes a key, and a key whose object isn't
@@ -15,9 +15,11 @@
  *
  * A slice runs for at most 2 ms from setImmediate, so a BGSAVE of millions of keys never holds
  * the event loop for long (rule 10). The file sink writes on libuv's thread pool; its callbacks
- * only move its own bytes and flags, never the keyspace (rule 1). Its rename runs on this
- * thread, after checking the job wasn't aborted, so nothing that runs later (a SAVE, a
- * FLUSHALL's save) can be overtaken by an old job's file.
+ * only move its own bytes and flags, never the keyspace (rule 1). What it writes comes from an
+ * encoder (the binary format, or commands for a rewrite), and how the finished file takes over
+ * is its commit step (a rename, or the rewrite's swap). The commit runs on this thread, after
+ * checking the job wasn't aborted, so nothing that runs later (a SAVE, a FLUSHALL's save) can
+ * be overtaken by an old job's file.
  *
  * Mirrors Redis rdb.c (rdbSaveBackground, bgsaveCommand, saveCommand, backgroundSaveDoneHandler,
  * killRDBChild), server.c (serverCron's save points) and, for what fork() does for free,
@@ -41,7 +43,7 @@ const BACKLOG_RETRY_MS = 1;
 /** After a failed BGSAVE, save points wait this long before trying again (spec 9.8). */
 export const BGSAVE_RETRY_MS = 5000;
 
-/** Where a job's keys go: a file, a command file (step 14), or memory (step 20). */
+/** Where a job's keys go: a file, a command file (an AOF rewrite), or memory (step 20). */
 export interface SnapshotSink {
   /** One key as it was when the job started; `expireAt` is -1 for none. */
   write(db: number, key: string, obj: RObj, expireAt: number): void;
@@ -68,6 +70,8 @@ const KIND_LABEL: Record<SnapshotJobKind, string> = {
 export interface SnapshotJobOptions {
   /** Slice length in ms; tests use 0 for one bucket per slice. */
   sliceMs?: number;
+  /** Runs after abort() has thrown the output away: a rewrite schedules itself again. */
+  onAbort?: () => void;
 }
 
 type State = 'walking' | 'finishing' | 'done' | 'aborted';
@@ -87,6 +91,7 @@ export class SnapshotJob {
   private cursor = 0;
   private cancel: (() => void) | null = null;
   private readonly sliceMs: number;
+  private readonly onAbort: (() => void) | undefined;
   /** The scan callback, made once: writes every unstamped key of `walkDb`. */
   private walkDb: Db | null = null;
   private readonly visit = (key: string, obj: RObj): void => {
@@ -113,6 +118,7 @@ export class SnapshotJob {
     this.epoch = ++server.snapshotEpoch;
     this.dirtyAtStart = server.dirty;
     this.sliceMs = options.sliceMs ?? SLICE_MS;
+    this.onAbort = options.onAbort;
     server.snapshotJob = this;
     this.schedule(false);
   }
@@ -149,6 +155,7 @@ export class SnapshotJob {
     this.sink.abort();
     this.release();
     this.server.log.notice(`${KIND_LABEL[this.kind]} aborted: ${reason}`);
+    this.onAbort?.();
   }
 
   /** One slice: walk until the time is up, the sink is backlogged, or every db is done. */
@@ -219,13 +226,31 @@ function skipBytes(buffers: readonly Buffer[], n: number): Buffer[] {
   return [buffers[i]!.subarray(n), ...buffers.slice(i + 1)];
 }
 
+/** What a file sink turns keys into: the binary format (SnapshotWriter) or commands. */
+export interface SinkEncoder {
+  writeKey(db: number, key: string, obj: RObj, expireAt: number): void;
+  /** Bytes produced and not yet taken. */
+  readonly pendingBytes: number;
+  /** The bytes produced since the last take(), in order. */
+  take(): Buffer[];
+  /** Whatever ends the output (EOF and CRC for binary). */
+  end(): void;
+}
+
+/** How a file sink's finished temp file takes over, once it's fully written and fsynced. */
+export interface FileCommit {
+  /** Synchronous, the temp file still open: last bytes in (a rewrite's buffer). May throw. */
+  beforeClose?(fd: number): void;
+  /** The temp file is closed: make it the real file, then call `done`. May throw. */
+  commit(done: (err: Error | null) => void): void;
+}
+
 /**
- * BGSAVE's sink: the binary format into `temp-<pid>-<n>.mrdb`, written asynchronously, then
- * fsync → rename over `dump.mrdb` → fsync the directory (rule 8).
+ * A job's output into a temp file, written asynchronously; then fsync, then the commit step:
+ * rename over `dump.mrdb` for BGSAVE (rule 8), the swap for an AOF rewrite.
  */
 export class FileSnapshotSink implements SnapshotSink {
   error: Error | null = null;
-  private readonly writer: SnapshotWriter;
   private readonly fd: number;
   private queue: Buffer[] = [];
   private queuedBytes = 0;
@@ -238,23 +263,22 @@ export class FileSnapshotSink implements SnapshotSink {
   /** Throws if the temp file can't be created. */
   constructor(
     readonly tempPath: string,
-    readonly path: string,
-    aux: ReadonlyArray<readonly [string, string]>,
+    private readonly encoder: SinkEncoder,
+    private readonly committer: FileCommit,
   ) {
     this.fd = fs.openSync(tempPath, 'w');
-    this.writer = new SnapshotWriter(aux);
   }
 
   get backlogged(): boolean {
-    return this.queuedBytes + this.writer.pendingBytes > MAX_PENDING_BYTES;
+    return this.queuedBytes + this.encoder.pendingBytes > MAX_PENDING_BYTES;
   }
 
   write(db: number, key: string, obj: RObj, expireAt: number): void {
-    this.writer.writeKey(db, key, obj, expireAt);
+    this.encoder.writeKey(db, key, obj, expireAt);
   }
 
   flush(): void {
-    for (const chunk of this.writer.take()) {
+    for (const chunk of this.encoder.take()) {
       this.queue.push(chunk);
       this.queuedBytes += chunk.length;
     }
@@ -262,7 +286,7 @@ export class FileSnapshotSink implements SnapshotSink {
   }
 
   end(done: (err: Error | null) => void): void {
-    this.writer.end();
+    this.encoder.end();
     this.ending = done;
     if (this.error !== null) {
       done(this.error);
@@ -317,14 +341,13 @@ export class FileSnapshotSink implements SnapshotSink {
         return;
       }
       try {
+        this.committer.beforeClose?.(this.fd);
         fs.closeSync(this.fd);
         this.closed = true;
-        fs.renameSync(this.tempPath, this.path);
+        this.committer.commit((commitErr) => this.ending!(commitErr));
       } catch (e) {
         this.failed(e as Error);
-        return;
       }
-      fsyncDir(dirname(this.path), (dirErr) => this.ending!(dirErr));
     });
   }
 
@@ -389,9 +412,15 @@ export class MemorySnapshotSink implements SnapshotSink {
 export function startBgsave(server: Server): boolean {
   server.lastBgsaveTry = Date.now();
   const temp = tempSnapshotPath(server.config.get('dir'), ++server.snapshotSeq);
+  const path = snapshotPath(server);
   let sink: FileSnapshotSink;
   try {
-    sink = new FileSnapshotSink(temp, snapshotPath(server), snapshotAux());
+    sink = new FileSnapshotSink(temp, new SnapshotWriter(snapshotAux()), {
+      commit(done) {
+        fs.renameSync(temp, path);
+        fsyncDir(dirname(path), done);
+      },
+    });
   } catch (e) {
     server.lastBgsaveStatus = 'err';
     server.log.warning(`Can't save in background: ${strerror(e)}`);

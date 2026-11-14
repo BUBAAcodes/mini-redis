@@ -126,8 +126,9 @@ export function flushallCommand(ctx: CommandContext): void {
   // As Redis 7.4's flushAllDataAndResetRDB: a BGSAVE still running is stopped, even one past
   // its walk, whose file holds the old data and would land after the save below. With save
   // points, the empty dataset is saved at once, so a restart can't bring the old data back.
-  // Not while the AOF replays: that would save a dataset still being rebuilt.
-  server.snapshotJob?.abort('FLUSHALL');
+  // Not while the AOF replays: that would save a dataset still being rebuilt. An AOF rewrite
+  // past its walk carries on: FLUSHALL reaches its buffer like any other write.
+  if (server.snapshotJob?.kind === 'bgsave') server.snapshotJob.abort('FLUSHALL');
   if (!server.loading && server.config.get('save').length > 0) saveSnapshot(server);
   // The save reset `dirty`, and Redis sends FLUSHALL to the AOF and replicas even when every
   // db was already empty.

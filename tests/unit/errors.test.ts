@@ -66,6 +66,11 @@ describe('error strings (spec 7.4, checked against redis:7.4)', () => {
       OFFSET_OUT_OF_RANGE: 'ERR offset is out of range',
       STRING_TOO_LONG: 'ERR string exceeds maximum allowed size (proto-max-bulk-len)',
       BGSAVE_IN_PROGRESS: 'ERR Background save already in progress',
+      BGSAVE_OTHER_JOB:
+        "ERR Another child process is active (AOF?): can't BGSAVE right now. Use BGSAVE SCHEDULE in order to schedule a BGSAVE whenever possible.",
+      AOF_REWRITE_IN_PROGRESS: 'ERR Background append only file rewriting already in progress',
+      AOF_REWRITE_FAILED:
+        "ERR Can't execute an AOF background rewriting. Please check the server logs for more information.",
       EXPIRE_NX_CONFLICT: 'ERR NX and XX, GT or LT options at the same time are not compatible',
       EXPIRE_GT_LT_CONFLICT: 'ERR GT and LT options at the same time are not compatible',
       DEBUG_NOT_ALLOWED:

@@ -212,13 +212,17 @@ describe('DEBUG RELOAD and restarts', () => {
   });
 
   it('with appendonly yes, startup loads the AOF and not the snapshot', async () => {
-    const [t, c] = await boot();
+    let [t, c] = await boot({ appendonly: 'yes' });
+    await c.call('SET', 'from-aof', '1');
+    await stop(t, c);
+    // With the AOF off, the AOF on disk is left alone and only the snapshot gets this key.
+    [t, c] = await boot();
     await c.call('SET', 'from-snapshot', '1');
     await c.call('SAVE');
     await stop(t, c);
-    // Loading the snapshot then needs a rewrite to put the data in the AOF (spec 9.9): step 14.
-    const [, c2] = await boot({ appendonly: 'yes' });
-    expect(await c2.call('EXISTS', 'from-snapshot')).toBe(0);
+    [, c] = await boot({ appendonly: 'yes' });
+    expect(await c.call('EXISTS', 'from-aof')).toBe(1);
+    expect(await c.call('EXISTS', 'from-snapshot')).toBe(0);
   });
 
   it('a damaged snapshot stops startup with its offset, and stays on disk', async () => {

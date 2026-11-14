@@ -23,6 +23,10 @@ const TEMP_FILE = /^temp-(?:\d+-\d+\.mrdb|rewrite-\d+\.aof)$/;
 export const tempSnapshotPath = (dir: string, n: number): string =>
   join(dir, `temp-${process.pid}-${n}.mrdb`);
 
+/** `temp-rewrite-<pid>.aof` in `dir`: there is only ever one rewrite at a time. */
+export const tempRewritePath = (dir: string): string =>
+  join(dir, `temp-rewrite-${process.pid}.aof`);
+
 /** Writes all of `data` at the file's current position, however many calls it takes. */
 export function writeAllSync(fd: number, data: Uint8Array): void {
   let written = 0;
