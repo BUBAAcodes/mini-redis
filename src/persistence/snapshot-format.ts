@@ -498,7 +498,8 @@ export function loadSnapshotFile(server: Server, path: string): FileLoadResult |
   }
   let loaded: LoadedSnapshot;
   try {
-    loaded = readSnapshot(server, data, { now: Date.now() });
+    // A primary skips keys already expired; a replica keeps them for its primary's DEL (9.9).
+    loaded = readSnapshot(server, data, { now: server.role === 'primary' ? Date.now() : null });
   } catch (e) {
     if (e instanceof SnapshotLoadError) {
       server.log.warning(`Bad snapshot file ${path}: ${e.message}. Not loading it.`);

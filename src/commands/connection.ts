@@ -95,8 +95,9 @@ export function clientSetinfoCommand(ctx: CommandContext): void {
 /** The class a client counts as, for CLIENT KILL TYPE and the output limits (step 22). */
 export type ClientType = 'normal' | 'replica' | 'pubsub' | 'master';
 
-/** Redis's getClientType; `master` (the link to our primary) arrives with step 21. */
+/** Redis's getClientType: the link to our primary first, then replicas, then subscribers. */
 export function clientType(client: Client): ClientType {
+  if (client.primaryLink) return 'master';
   if (client.repl !== null) return 'replica';
   if (client.channels.size + client.patterns.size > 0) return 'pubsub';
   return 'normal';

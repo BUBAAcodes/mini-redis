@@ -10,7 +10,8 @@
  *
  * The AOF loader runs its commands on a client with no socket (Redis's fake client,
  * CLIENT_ID_AOF): it is never registered with the server, its replies are thrown away, and it
- * can never block.
+ * can never block. On a replica, the link to the primary is a client too (`primaryLink`,
+ * Redis's CLIENT_MASTER): obeyed like the AOF loader, never answered, never blocked.
  *
  * Mirrors Redis networking.c (createClient, freeClient) and the client struct in server.h.
  */
@@ -79,6 +80,11 @@ export class Client {
   replCapaPsync2 = false;
   /** Set by PSYNC: this connection is a replica (spec 9.2). */
   repl: ReplicaLink | null = null;
+  /**
+   * On a replica, the connection to its primary once the handshake is done (Redis's
+   * CLIENT_MASTER): its commands are obeyed without the checks a user gets, and never answered.
+   */
+  primaryLink = false;
   /** When its output first passed its class's soft limit; 0 while under it. */
   softLimitSince = 0;
 
@@ -93,17 +99,25 @@ export class Client {
     this.parser = new RespParser(limits);
   }
 
-  /** The AOF loader's client: it obeys every command, without the checks a user gets. */
+  /** The AOF loader's client. */
   get isAofClient(): boolean {
     return this.socket === null;
   }
 
   /**
-   * A blocking command must answer at once instead of waiting: inside a transaction, and while
-   * replaying the AOF, where a wait could never end (Redis's CLIENT_DENY_BLOCKING).
+   * Obeyed without the checks a user gets (OOM, MISCONF, READONLY, subscriber mode): the AOF
+   * loader and a replica's primary link, whose commands already ran on the primary.
+   */
+  get obeyed(): boolean {
+    return this.socket === null || this.primaryLink;
+  }
+
+  /**
+   * A blocking command must answer at once instead of waiting: inside a transaction, and for
+   * the AOF loader and the primary link, where a wait could never end (CLIENT_DENY_BLOCKING).
    */
   get denyBlocking(): boolean {
-    return this.multi || this.socket === null;
+    return this.multi || this.obeyed;
   }
 
   get resp(): RespVersion {

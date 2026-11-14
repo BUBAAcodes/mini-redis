@@ -14,7 +14,7 @@ const handlerName = (name: string): string =>
     .join('') + 'Command';
 
 describe('command table (spec 7.9)', () => {
-  it('has every command built so far (steps 5 to 20)', () => {
+  it('has every command built so far (steps 5 to 21)', () => {
     const names = [...buildCommandTable().keys()].sort();
     expect(names).toEqual(
       [
@@ -91,6 +91,7 @@ describe('command table (spec 7.9)', () => {
         'randomkey',
         'rename',
         'replconf',
+        'replicaof',
         'role',
         'rpop',
         'rpush',
@@ -106,6 +107,7 @@ describe('command table (spec 7.9)', () => {
         'sinter',
         'sinterstore',
         'sismember',
+        'slaveof',
         'smembers',
         'spop',
         'srandmember',

@@ -13,7 +13,8 @@
  * `appendonly yes`, no AOF and a snapshot, the snapshot is loaded and a rewrite turns it into
  * the AOF (aof-rewrite.ts). All of it happens before the listener opens, so no client ever sees
  * a half-loaded dataset. A damaged AOF or snapshot makes start() reject; it never starts empty
- * over good data.
+ * over good data. With `replicaof` set, the server is a replica from the start (it keeps
+ * expired keys while loading), and its link to the primary opens once it listens.
  *
  * Mirrors Redis server.c (initServer, the redisServer struct) and networking.c
  * (acceptTcpHandler, readQueryFromClient, processInputBuffer, freeClient).
@@ -34,8 +35,10 @@ import { removeLeftoverTemps } from '../persistence/files.js';
 import { loadSnapshotFile, snapshotPath } from '../persistence/snapshot-format.js';
 import type { SnapshotJob } from '../persistence/snapshot-job.js';
 import { ProtocolError } from '../protocol/errors.js';
+import type { ParserLimits } from '../protocol/parser.js';
 import { PubSubHub } from '../pubsub/hub.js';
 import { Replication } from '../replication/primary.js';
+import { PrimaryLink } from '../replication/replica.js';
 import { Db } from '../storage/database.js';
 import { EvictionPool, isLfuPolicy, performEvictions } from '../storage/eviction.js';
 import { unwatchAllKeys } from '../storage/watch.js';
@@ -108,6 +111,8 @@ export class Server {
   readonly propagator = new Propagator(() => this.eventLoop.scheduleBeforeSleep());
   /** Replication ID and offset, the backlog, the replicas and WAIT (spec 9.13). */
   readonly repl: Replication = new Replication(this);
+  /** On a replica, the link to the primary it follows (spec 9.13); idle on a primary. */
+  readonly primaryLink: PrimaryLink = new PrimaryLink(this);
   readonly cron: Cron;
   /** Channels and patterns (spec 9.11); a frame goes onto the client's output queue. */
   readonly pubsub = new PubSubHub<Client>((client, frame) => {
@@ -165,8 +170,13 @@ export class Server {
   /** A BGSAVE asked for inside EXEC, started by serverCron once the transaction is over. */
   bgsaveScheduled = false;
 
-  /** `replica` once REPLICAOF follows a primary (step 21): it then ignores `maxmemory`. */
+  /**
+   * `replica` while following a primary (REPLICAOF, or `replicaof` in the config): it is then
+   * read-only, ignores `maxmemory`, and hides expired keys instead of deleting them.
+   */
   role: 'primary' | 'replica' = 'primary';
+  /** The client whose command is running, or null between commands (Redis's current_client). */
+  currentClient: Client | null = null;
   /** True under an LFU policy, when `RObj.lru` holds minutes and a counter (spec 9.4). */
   lfuEnabled = false;
   /** Eviction candidates kept between evictions (spec 9.4). */
@@ -190,7 +200,7 @@ export class Server {
     this.config = options.config ?? new Config();
     this.log = new Logger({
       level: () => this.config.get('loglevel'),
-      role: () => 'M',
+      role: () => (this.role === 'replica' ? 'S' : 'M'),
       ...(options.log ? { write: options.log } : {}),
     });
     this.onFatal = options.fatal ?? (() => process.exit(1));
@@ -229,6 +239,8 @@ export class Server {
     for (const name of removeLeftoverTemps(dir)) {
       this.log.notice(`Removed leftover temp file ${name}`);
     }
+    const primary = this.config.get('replicaof');
+    if (primary !== null) this.role = 'replica';
     if (!this.config.get('appendonly')) loadSnapshotFile(this, snapshotPath(this));
     else if (!existsSync(aofPath(this)) && loadSnapshotFile(this, snapshotPath(this)) !== null) {
       // Spec 9.9 step 2: the snapshot's data must reach the AOF before an AOF exists.
@@ -250,6 +262,8 @@ export class Server {
     this.log.notice(`Running mode=standalone, port=${this.port}.`);
     this.log.notice('Server initialized');
     this.log.notice('Ready to accept connections tcp');
+    // Spec 9.9 step 5.
+    if (primary !== null) this.primaryLink.setPrimary(primary.host, primary.port);
   }
 
   /**
@@ -261,6 +275,7 @@ export class Server {
     if (this.shuttingDown) return;
     this.shuttingDown = true;
     this.cron.stop();
+    this.primaryLink.stop();
     if (this.evictionTimer !== null) clearImmediate(this.evictionTimer);
     this.evictionTimer = null;
     this.snapshotJob?.abort('shutdown');
@@ -321,6 +336,13 @@ export class Server {
   killClient(client: Client): void {
     this.freeClient(client);
     client.socket?.destroy();
+  }
+
+  /** A client for a socket the server opened itself: a replica's link to its primary. */
+  registerClient(socket: Socket, limits: ParserLimits): Client {
+    const client = new Client(this.nextClientId++, socket, limits);
+    this.clients.set(client.id, client);
+    return client;
   }
 
   /** Queues a client for the next beforeSleep: it has replies (or a close) waiting. */
@@ -465,5 +487,6 @@ export class Server {
     this.waiters.unblock(client);
     this.unblockedClients.delete(client);
     this.repl.freeClient(client);
+    if (client.primaryLink) this.primaryLink.linkLost(client);
   }
 }

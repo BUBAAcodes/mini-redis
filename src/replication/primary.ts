@@ -22,6 +22,12 @@
  * Replicas never get replies: PSYNC's answers and the stream are written from their own queue
  * of Buffers, and a replica whose command produced a reply is disconnected, as Redis does.
  *
+ * On a replica (replica.ts) this object keeps the history it shares with its primary: `replid`
+ * is the primary's, `masterReplOffset` is the offset of the last byte applied, and the backlog
+ * holds the primary's raw bytes (spec 9.5), fed by feedFromPrimary() rather than through
+ * propagation. That's what lets a promoted replica serve the other replicas' PSYNC (spec 9.13
+ * Promotion). Chained replicas are out of scope, so a replica has no replicas of its own.
+ *
  * Mirrors Redis replication.c (replicationFeedSlaves, syncCommand,
  * masterTryPartialResynchronization, addReplyReplicationBacklog, startBgsaveForReplication,
  * updateSlavesWaitingBgsave, replconfCommand, waitCommand, processClientsWaitingReplicas,
@@ -102,8 +108,15 @@ export class Replication implements PropagationSink {
   private getackRequested = false;
   private lastPing = 0;
   private lastCron = 0;
+  /** Detaches the stream from the propagator; null until a backlog exists. */
+  private detach: (() => void) | null = null;
 
   constructor(private readonly server: Server) {}
+
+  /** The db the stream's last record ran in (0 if the next one will say). */
+  get streamDb(): number {
+    return Math.max(this.seldb, 0);
+  }
 
   /** For tests and INFO: clients blocked in WAIT. */
   get waitingCount(): number {
@@ -112,8 +125,13 @@ export class Replication implements PropagationSink {
 
   // --- the stream -------------------------------------------------------------------------
 
-  /** The propagation sink: every record goes into the stream once, PUBLISH included. */
+  /**
+   * The propagation sink: every record goes into the stream once, PUBLISH included. Not on a
+   * replica: its backlog gets the primary's own bytes instead (feedFromPrimary), and its AOF
+   * gets the records through the other sink.
+   */
   append(record: PropagationRecord): void {
+    if (this.server.role === 'replica') return;
     let bytes = encodeCommand(record.argv);
     if (record.db !== this.seldb) {
       bytes = encodeCommand(['SELECT', String(record.db)]) + bytes;
@@ -132,6 +150,15 @@ export class Replication implements PropagationSink {
     this.backlog!.append(bytes);
     this.masterReplOffset += bytes.length;
     this.turn += bytes;
+  }
+
+  /**
+   * On a replica: bytes of the primary's stream just applied, exactly as they arrived, so our
+   * offset and backlog match the primary's byte for byte (spec 9.5, rule 13).
+   */
+  feedFromPrimary(bytes: string): void {
+    this.backlog!.append(bytes);
+    this.masterReplOffset += bytes.length;
   }
 
   /** Hands this turn's bytes to the replicas that get the stream now. */
@@ -261,10 +288,51 @@ export class Replication implements PropagationSink {
     );
     this.seldb = -1;
     this.lastPing = Date.now();
-    this.server.propagator.attach(this);
+    if (this.detach === null) this.detach = this.server.propagator.attach(this);
     this.server.log.notice(
       `Replication backlog created, my new replication IDs are '${this.replid}' and '${this.replid2}'`,
     );
+  }
+
+  /**
+   * A full sync from a primary: its history is now ours. The backlog starts again at `offset`,
+   * since nothing before it matches the data just loaded.
+   */
+  setPrimaryHistory(replid: string, offset: number): void {
+    this.replid = replid;
+    this.replid2 = NO_REPLID;
+    this.secondReplidOffset = -1;
+    this.masterReplOffset = offset;
+    this.backlog = new ReplicationBacklog(this.server.config.get('repl-backlog-size'), offset);
+    this.seldb = -1;
+    this.turn = '';
+    if (this.detach === null) this.detach = this.server.propagator.attach(this);
+  }
+
+  /**
+   * Promotion, or a primary that answered +CONTINUE with a new ID (spec 9.13): the current ID
+   * becomes replid2, valid up to the next byte, and `next` the ID from now on. The next record
+   * carries a SELECT, as the stream's db is unknown to whoever continues from here.
+   */
+  shiftReplid(next: string = newReplid()): void {
+    this.replid2 = this.replid;
+    this.secondReplidOffset = this.masterReplOffset + 1;
+    this.replid = next;
+    this.seldb = -1;
+    this.server.log.notice(
+      `Setting secondary replication ID to ${this.replid2}, valid up to offset: ${this.secondReplidOffset}. New replication ID is ${this.replid}`,
+    );
+  }
+
+  /** What to PSYNC with: our history if we have one, else ask for a full sync (spec 9.13). */
+  psyncArgs(): [replid: string, offset: string] {
+    if (this.backlog === null) return ['?', '-1'];
+    return [this.replid, String(this.masterReplOffset + 1)];
+  }
+
+  /** Becoming a replica (spec 9.13 Promotion, step 3): every replica reconnects and syncs again. */
+  disconnectReplicas(): void {
+    for (const client of [...this.replicas]) this.server.killClient(client);
   }
 
   /** CONFIG SET repl-backlog-size. */
@@ -480,13 +548,14 @@ export class Replication implements PropagationSink {
 
   // --- reporting --------------------------------------------------------------------------
 
-  /** INFO's `# Replication` fields on a primary (spec 13.1). */
+  /** INFO's `# Replication` fields (spec 13.1); a replica adds its link's after `role`. */
   infoFields(): Array<[string, string | number]> {
     const now = Date.now();
-    const fields: Array<[string, string | number]> = [
-      ['role', 'master'],
-      ['connected_slaves', this.replicas.size],
-    ];
+    const fields: Array<[string, string | number]> =
+      this.server.role === 'replica'
+        ? [['role', 'slave'], ...this.server.primaryLink.infoFields(now)]
+        : [['role', 'master']];
+    fields.push(['connected_slaves', this.replicas.size]);
     let i = 0;
     for (const client of this.replicas) {
       const link = linkOf(client);
@@ -513,6 +582,10 @@ export class Replication implements PropagationSink {
 
   /** ROLE on a primary: its online replicas' address, listening port and ACK offset. */
   roleReply(ctx: CommandContext): void {
+    if (this.server.role === 'replica') {
+      this.server.primaryLink.roleReply(ctx);
+      return;
+    }
     const online = [...this.replicas].filter((c) => linkOf(c).state === 'online');
     const reply = ctx.reply;
     reply.arrayLen(3);

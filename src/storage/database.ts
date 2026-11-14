@@ -25,7 +25,9 @@
  * deadline, so no command can see an expired value (rule 7). The deletion is propagated as
  * `DEL key` at once, ahead of the running command's own record (spec 9.5), but it doesn't count
  * in `server.dirty`: the dispatcher reads a grown dirty counter as "this command changed
- * something", and a DEL of an expired key must not also propagate as itself.
+ * something", and a DEL of an expired key must not also propagate as itself. A replica hides
+ * an expired key instead and keeps it until its primary's DEL arrives (spec 9.3), while the
+ * primary's own commands still see it, as the primary may not have expired it yet.
  *
  * Mirrors Redis db.c (lookupKeyRead, lookupKeyWrite, dbAdd, setKey, dbDelete,
  * signalModifiedKey, expireIfNeeded, deleteExpiredKeyAndPropagate, setExpire, removeExpire,
@@ -81,8 +83,7 @@ export class Db {
 
   /** For reads: counts a hit or a miss and touches the key's LRU clock. */
   lookupRead(key: string): RObj | null {
-    this.expireIfNeeded(key);
-    const obj = this.dict.get(key);
+    const obj = this.expireIfNeeded(key) ? undefined : this.dict.get(key);
     if (obj === undefined) {
       this.server.stats.keyspaceMisses++;
       return null;
@@ -94,7 +95,7 @@ export class Db {
 
   /** Like lookupRead, without touching LRU/LFU or the stats (TYPE, TTL, EXISTS, OBJECT). */
   peek(key: string): RObj | null {
-    this.expireIfNeeded(key);
+    if (this.expireIfNeeded(key)) return null;
     return this.dict.get(key) ?? null;
   }
 
@@ -103,7 +104,7 @@ export class Db {
    * running snapshot saves it first.
    */
   lookupWrite(key: string): RObj | null {
-    this.expireIfNeeded(key);
+    if (this.expireIfNeeded(key, true)) return null;
     const obj = this.dict.get(key);
     if (obj === undefined) return null;
     this.beforeChange(key, obj);
@@ -113,6 +114,8 @@ export class Db {
 
   /** Adds a key that must not exist yet. */
   add(key: string, obj: RObj): void {
+    // A replica may still store a key it hides; a writable replica's client replaces it.
+    if (this.server.role === 'replica') this.expireIfNeeded(key, true);
     this.stampNew(obj);
     this.server.snapshotJob?.stamp(obj);
     if (!this.dict.set(key, obj)) throw new Error(`Db.add: key already exists`);
@@ -205,13 +208,18 @@ export class Db {
 
   /**
    * A random live key, or null if there is none. An expired pick is deleted and the draw
-   * repeated; each retry shrinks the db, so this always ends.
+   * repeated; each retry shrinks the db, so this always ends. A replica only hides expired keys,
+   * so when every key has a TTL they could all be hidden: like Redis's dbRandomKey, it then gives
+   * up after 100 draws and returns the last one.
    */
   randomKey(): string | null {
+    const allVolatile = this.dict.size === this.expires.size;
+    let tries = 100;
     for (;;) {
       const entry = this.dict.randomEntry();
       if (entry === null) return null;
       if (!this.expireIfNeeded(entry[0])) return entry[0];
+      if (allVolatile && this.server.role === 'replica' && --tries === 0) return entry[0];
     }
   }
 
@@ -316,12 +324,19 @@ export class Db {
   }
 
   /**
-   * Deletes the key if its deadline has passed (`cmdTime > deadline`, as in Redis's
-   * keyIsExpired) and returns whether it did. Lookups call it; so do SCAN and RANDOMKEY.
+   * True if the key's deadline has passed (`cmdTime > deadline`, as in Redis's keyIsExpired), so
+   * the caller must treat it as missing; a primary also deletes it. Lookups call it; so do SCAN
+   * and RANDOMKEY. On a replica the key is only hidden, since the primary's DEL will come, and
+   * the primary link sees it as live. `force` deletes it on a replica too: a client's write on a
+   * writable replica (Redis's EXPIRE_FORCE_DELETE_EXPIRED).
    */
-  expireIfNeeded(key: string): boolean {
+  expireIfNeeded(key: string, force = false): boolean {
     if (!this.isExpired(key)) return false;
-    // A replica (step 21) stops here: it hides the key and waits for its primary's DEL.
+    const server = this.server;
+    if (server.role === 'replica') {
+      if (server.currentClient?.primaryLink) return false;
+      if (!force) return true;
+    }
     this.deleteExpired(key);
     return true;
   }

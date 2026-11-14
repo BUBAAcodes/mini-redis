@@ -206,7 +206,7 @@ function expireGeneric(
     ctx.reply.integer(0);
     return;
   }
-  if (deadline <= ctx.server.cmdTime) {
+  if (ctx.deadlinePassed(deadline)) {
     // Already past: the key goes now, and a replay must delete it rather than set a TTL.
     ctx.db.delete(key);
     ctx.db.signalModifiedKey(key);

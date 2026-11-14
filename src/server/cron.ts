@@ -7,9 +7,9 @@
  * the LRU clock, expires keys, rehashes, evicts while over `maxmemory` and records the memory
  * peak, runs the AOF's retries and `everysec` fsync, starts scheduled and automatic AOF
  * rewrites, starts BGSAVEs for save points, and runs the primary's replication chores (full
- * syncs waiting for a job, heartbeats, keepalives, replica timeouts and output limits). Client
- * timeouts and other output limits (22), the replica link (21) and ops/sec sampling (23) join
- * later.
+ * syncs waiting for a job, heartbeats, keepalives, replica timeouts and output limits) and, on a
+ * replica, its link's (ACKs, reconnects, timeouts). Client timeouts and other output limits
+ * (22) and ops/sec sampling (23) join later.
  *
  * Mirrors Redis server.c (serverCron, databasesCron).
  */
@@ -59,8 +59,8 @@ export class Cron {
   tick(): void {
     this.ticks++;
     this.server.lruClock = lruClockNow();
-    // A replica (step 21) skips this: its keys go only when its primary sends DEL.
-    if (this.server.activeExpireEnabled) {
+    // Not on a replica: its keys go only when its primary sends DEL (spec 9.3).
+    if (this.server.activeExpireEnabled && this.server.role === 'primary') {
       activeExpireCycle(this.server, this.interval * ACTIVE_EXPIRE_SHARE);
     }
     for (const db of this.server.dbs) db.cron(REHASH_MS);
@@ -73,7 +73,9 @@ export class Cron {
     aofRewriteCron(this.server);
     // Save points and a scheduled BGSAVE (spec 9.8).
     snapshotCron(this.server);
-    // A full sync that waited for a job, then the once-a-second chores (spec 9.13).
+    // A full sync that waited for a job, then the once-a-second chores (spec 9.13); on a replica,
+    // its link's: ACKs, reconnects and timeouts.
     this.server.repl.cron();
+    this.server.primaryLink.cron();
   }
 }

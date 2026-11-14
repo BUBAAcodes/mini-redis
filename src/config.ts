@@ -473,6 +473,14 @@ export class Config {
     return this.values[name];
   }
 
+  /**
+   * Changes a directive from inside the server, with no checks and no listeners: REPLICAOF
+   * records the primary it follows, so CONFIG GET replicaof shows it, as in Redis.
+   */
+  setInternal<K extends ConfigName>(name: K, value: ConfigValues[K]): void {
+    this.values[name] = value;
+  }
+
   /** Runs after every successful CONFIG SET with the directives it changed. */
   onChange(listener: (names: readonly ConfigName[]) => void): void {
     this.listeners.push(listener);

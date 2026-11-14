@@ -12,9 +12,13 @@
  * will abort; one that passes is queued and runs later through call(), the same path as a
  * normal command, so stats and propagation can't differ between the two.
  *
- * The AOF loader's client is obeyed: it skips the client-facing checks (OOM, MISCONF, subscriber
- * mode, and later NOAUTH and READONLY), and while the server loads, call() keeps no stats
- * and serves no blocked clients, so a replay changes nothing but the data.
+ * The AOF loader's client and a replica's primary link are obeyed: they skip the client-facing
+ * checks (OOM, MISCONF, READONLY, subscriber mode, and later NOAUTH), since their commands
+ * already ran once. While the server loads, call() keeps no stats and serves no blocked
+ * clients, so a replay changes nothing but the data.
+ *
+ * On a replica with `replica-read-only yes`, a write from anyone else gets -READONLY (rule 13),
+ * checked where Redis's processCommand checks it: after MISCONF, ahead of subscriber mode.
  *
  * Memory (rule 14): before a `denyoom` command, or an EXEC whose queue holds one, eviction
  * runs; if the estimate is still over `maxmemory`, the command gets -OOM and nothing changes.
@@ -78,8 +82,8 @@ export function dispatch(server: Server, client: Client, argv: readonly string[]
       return;
     }
   }
-  // The AOF loader's client is obeyed, as in Redis: nothing below applies to it.
-  if (client.isAofClient) {
+  // The AOF loader's client and the primary link are obeyed, as in Redis: nothing below applies.
+  if (client.obeyed) {
     if (client.multi && !RUN_INSIDE_MULTI.has(top.name)) client.queued.push({ spec, argv });
     else call(server, client, spec, argv);
     return;
@@ -99,6 +103,15 @@ export function dispatch(server: Server, client: Client, argv: readonly string[]
     reject(client, spec, misconf(diskError));
     return;
   }
+  // 6. A read-only replica takes writes only from its primary (rule 13).
+  if (
+    server.role === 'replica' &&
+    server.config.get('replica-read-only') &&
+    isWriteCommand(client, spec, top.name)
+  ) {
+    reject(client, spec, ERR.READONLY);
+    return;
+  }
   // 4. RESP2 subscriber mode: only the subscription commands, PING and QUIT.
   if (inSubscriberMode(client) && !SUBSCRIBER_COMMANDS.has(top.name)) {
     reject(client, spec, subscriberContext(spec.name));
@@ -109,7 +122,6 @@ export function dispatch(server: Server, client: Client, argv: readonly string[]
     reject(client, spec, ERR.NOT_ALLOWED_IN_MULTI);
     return;
   }
-  // 6 joins here: -READONLY on a replica (21).
   if (client.multi && !RUN_INSIDE_MULTI.has(top.name)) {
     client.queued.push({ spec, argv });
     client.reply.simple('QUEUED');
@@ -124,10 +136,15 @@ function deniedOnOom(client: Client, spec: CommandSpec, name: string): boolean {
   return name === 'exec' && client.queued.some((q) => q.spec.flags.includes('denyoom'));
 }
 
-/** A write, PING, or an EXEC whose queue holds a write (Redis's is_write_command). */
-function deniedByDiskError(client: Client, spec: CommandSpec, name: string): boolean {
-  if (spec.flags.includes('write') || name === 'ping') return true;
+/** A write, or an EXEC whose queue holds one (Redis's is_write_command). */
+function isWriteCommand(client: Client, spec: CommandSpec, name: string): boolean {
+  if (spec.flags.includes('write')) return true;
   return name === 'exec' && client.queued.some((q) => q.spec.flags.includes('write'));
+}
+
+/** What MISCONF refuses: a write, or PING so health checks notice (writeCommandsDeniedByDiskError). */
+function deniedByDiskError(client: Client, spec: CommandSpec, name: string): boolean {
+  return name === 'ping' || isWriteCommand(client, spec, name);
 }
 
 /**
@@ -176,6 +193,9 @@ export function call(
   server.propagator.begin();
   // Read the clock once, so a key can't expire halfway through a command (spec 7.5).
   if (!options.inExec) server.cmdTime = Date.now();
+  // Who runs it: on a replica, the primary link sees keys the clients see as expired.
+  const callerBefore = server.currentClient;
+  server.currentClient = client;
   const start = process.hrtime.bigint();
   try {
     spec.handler(ctx);
@@ -187,6 +207,8 @@ export function call(
       server.log.warning(`Internal error running '${spec.name}': ${detail}`);
       client.reply.error(ERR.INTERNAL);
     }
+  } finally {
+    server.currentClient = callerBefore;
   }
   const usec = Number(process.hrtime.bigint() - start) / 1000;
 

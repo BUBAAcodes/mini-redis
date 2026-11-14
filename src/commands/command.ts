@@ -74,6 +74,15 @@ export class CommandContext {
   forcePropagation(): void {
     this.server.propagator.force();
   }
+
+  /**
+   * A deadline already reached, so the key goes now and the command propagates DEL (spec 9.3
+   * step 3). Never on a replica: it keeps the TTL, hides the key, and waits for its primary's
+   * DEL, as Redis's checkAlreadyExpired.
+   */
+  deadlinePassed(ms: number): boolean {
+    return ms <= this.server.cmdTime && this.server.role === 'primary';
+  }
 }
 
 /** Builds a top-level spec. `keys` is [first, last, step]; [0, 0, 0] for no keys. */

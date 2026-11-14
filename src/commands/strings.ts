@@ -172,7 +172,7 @@ export function getexCommand(ctx: CommandContext): void {
   const deadline =
     args.unit === null ? null : expireDeadline(ctx, 'getex', args.unit, args.expire!);
   ctx.reply.bulk(obj.value);
-  if (deadline !== null && Number(deadline) <= ctx.server.cmdTime) {
+  if (deadline !== null && ctx.deadlinePassed(Number(deadline))) {
     // Only EXAT or PXAT can name a past deadline (EX and PX must be positive): the key goes now.
     ctx.db.delete(key);
     ctx.db.signalModifiedKey(key);
