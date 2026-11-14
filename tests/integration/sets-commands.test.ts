@@ -199,7 +199,8 @@ describe('SRANDMEMBER limits (DIFFERENCES.md)', () => {
     expect(await c.raw('SRANDMEMBER', 's', '-1048577')).toBe(
       err('ERR value is out of range, value must between -1048576 and 9223372036854775807'),
     );
-  });
+    // A million-item reply takes about 10 s on its own, half the default budget.
+  }, 60_000);
 });
 
 describe('SSCAN', () => {

@@ -1,6 +1,8 @@
 // Step 13: snapshots end to end (spec 9.8, 9.9, 11.2): SAVE, BGSAVE and LASTSAVE with Redis
 // 7.4's replies (checked against the reference), DEBUG RELOAD, loading at startup, save points,
-// FLUSHALL, damaged files, and BGSAVE staying point-in-time and pause-free under load.
+// FLUSHALL, damaged files, and BGSAVE staying point-in-time under load. The PING latency check
+// during a 1M-key BGSAVE lives in tests/perf/ (npm run test:perf): it would starve the
+// rest of this suite of CPU when the machine is slow.
 import fs from 'node:fs';
 import { existsSync, mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
@@ -357,32 +359,5 @@ describe('BGSAVE under load', () => {
     const a = Number(await c.call('GET', 'A'));
     const b = Number(await c.call('GET', 'B'));
     expect(a + b).toBe(TOTAL);
-  }, 120_000);
-
-  it('no PING waits over 50 ms during a BGSAVE of 1M keys', async () => {
-    const [t, c] = await boot({ save: '' });
-    fillDirect(t, 1_000_000, 'value');
-    const ping = await TestClient.connect(t.port);
-    open.push(ping);
-    expect(await c.call('BGSAVE')).toBe('Background saving started');
-    let worst = 0;
-    let pings = 0;
-    const started = performance.now();
-    while (t.server.snapshotJob !== null) {
-      const sent = performance.now();
-      expect(await ping.call('PING')).toBe('PONG');
-      worst = Math.max(worst, performance.now() - sent);
-      pings++;
-    }
-    const seconds = (performance.now() - started) / 1000;
-    // Recorded in docs/walkthroughs/step-13.md and, in step 24, bench/RESULTS.md.
-    console.log(
-      `BGSAVE of 1M keys: ${seconds.toFixed(2)} s, ${pings} PINGs, worst ${worst.toFixed(1)} ms`,
-    );
-    expect(t.server.lastBgsaveStatus).toBe('ok');
-    expect(pings).toBeGreaterThan(10);
-    expect(worst).toBeLessThan(50);
-    const loaded = readSnapshot(t.server, readFileSync(dumpPath()), { now: null });
-    expect(loaded.keys).toBe(1_000_000);
   }, 120_000);
 });

@@ -23,6 +23,7 @@ export default defineConfig({
       project('crash', 600_000),
       project('fuzz', 600_000),
       project('replication', 60_000),
+      project('perf', 120_000),
     ],
     coverage: {
       provider: 'v8',

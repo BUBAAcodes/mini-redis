@@ -29,12 +29,12 @@ At the next startup with `appendonly no`, `Server.start` deletes leftover temp f
 ## Trade-offs, and what Redis does differently
 
 - **No fork.** Redis's `rdbSaveBackground` (`rdb.c`) forks, and the kernel copies touched 4 KB pages. We copy whole values in the hook, so changing a huge list mid-BGSAVE costs one pause the size of that list (ADR 0010).
-- **Measured:** a BGSAVE of 1M small strings took about 0.9 s with 800–1,300 PINGs answered, the worst at 10.2–14.7 ms over three runs (limit 50 ms). The 2 ms slices aren't the worst case; GC and buffer allocation are the likely tail.
+- **Measured:** a BGSAVE of 1M small strings took about 0.9 s with 800–1,300 PINGs answered, the worst at 10.2–14.7 ms over three runs (limit 50 ms; `npm run test:perf`, kept out of `npm test` so its 1M keys can't starve the parallel suites). The 2 ms slices aren't the worst case; GC and buffer allocation are the likely tail.
 - **FLUSHDB aborts the job.** Redis's child just finishes with the pre-flush data (`docs/DIFFERENCES.md`). FLUSHALL with save points then writes the empty dataset, as `flushAllDataAndResetRDB` (`db.c`) does.
 - **DEBUG RELOAD** (`debug.c`) empties the data and then loads. Ours swaps data in only after a fully checked load.
 - **Not yet:** saving at SHUTDOWN (step 23), and "`appendonly yes`, no AOF, a snapshot → load it, then rewrite", which needs step 14.
 
-Tests: `tests/unit/crc64.test.ts` (5), `snapshot-format.test.ts` (12: round trip, every flipped byte, every truncation, crafted bad files), `snapshot-job.test.ts` (21: eight seeded random-write runs between slices, plus hook, abort, backlog, failures and save points), and `tests/integration/snapshot.test.ts` (18, covering every "Done when" item).
+Tests: `tests/unit/crc64.test.ts` (5), `snapshot-format.test.ts` (12: round trip, every flipped byte, every truncation, crafted bad files), `snapshot-job.test.ts` (21: eight seeded random-write runs between slices, plus hook, abort, backlog, failures and save points), `tests/integration/snapshot.test.ts` (17), and `tests/perf/bgsave-latency.test.ts` (1, the PING check); together they cover every "Done when" item.
 
 ## The single most important line
 

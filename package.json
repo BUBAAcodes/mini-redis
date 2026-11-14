@@ -19,7 +19,8 @@
     "test:crash": "npm run build && vitest run --project crash",
     "test:fuzz": "vitest run --project fuzz",
     "test:repl": "vitest run --project replication",
-    "test:all": "npm test && npm run test:diff && npm run test:crash && npm run test:fuzz && npm run test:repl",
+    "test:perf": "vitest run --project perf",
+    "test:all": "npm test && npm run test:diff && npm run test:crash && npm run test:fuzz && npm run test:repl && npm run test:perf",
     "bench": "bash bench/run.sh"
   },
   "keywords": [
