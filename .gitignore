@@ -4,3 +4,4 @@ data
 coverage
 *.log
 .env
+bench/profiles/

@@ -187,6 +187,13 @@ describe('WATCH', () => {
     expect(await watchedExec('k', () => a.call('SET', 'k', '2'))).toBe('*-1\r\n');
   });
 
+  it('INCR and its family are changes, on an existing key or a new one', async () => {
+    await a.call('SET', 'k', '1');
+    expect(await watchedExec('k', () => b.call('INCR', 'k'))).toBe('*-1\r\n');
+    expect(await watchedExec('k', () => b.call('DECRBY', 'k', '5'))).toBe('*-1\r\n');
+    expect(await watchedExec('fresh', () => b.call('INCR', 'fresh'))).toBe('*-1\r\n');
+  });
+
   it('EXPIRE and RENAME onto the key are changes', async () => {
     await a.call('SET', 'k', '1');
     expect(await watchedExec('k', () => b.call('EXPIRE', 'k', '100'))).toBe('*-1\r\n');

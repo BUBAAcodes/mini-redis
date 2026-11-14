@@ -6,7 +6,9 @@
  * Nothing is concatenated per chunk; a line-end search resumes where the last one stopped; and a
  * bulk of BIG_ARG bytes or more gets one buffer of its exact size, filled as data arrives. So a
  * byte-at-a-time pipeline and a 64 MB bulk both cost O(bytes). Each argument becomes a latin1
- * byte string exactly once (spec 7.1).
+ * byte string exactly once (spec 7.1). Header lines and bulk bodies that sit inside one chunk,
+ * which is nearly all of them, are read in place by offset, with no Buffer view made for each
+ * one (step 24's optimisation; see bench/RESULTS.md).
  *
  * Mirrors Redis networking.c (processInlineBuffer, processMultibulkBuffer) and sds.c
  * (sdssplitargs). Behaviour was checked byte for byte against redis:7.4.
@@ -58,6 +60,8 @@ const DOLLAR = 0x24;
 const SQUOTE = 0x27;
 const STAR = 0x2a;
 const MINUS = 0x2d;
+/** What `view` holds between commands, so a parser never pins a socket chunk it has finished. */
+const NO_VIEW = Buffer.alloc(0);
 const ZERO = 0x30;
 const BACKSLASH = 0x5c;
 const LOWER_X = 0x78;
@@ -79,6 +83,11 @@ export class RespParser {
   private bigFilled = 0;
 
   private consumed = 0; // bytes used so far by the command being parsed
+  // Where consume() left the bytes it just took: view[viewAt, viewAt + n). The chunk itself when
+  // they sat in one chunk, otherwise a copy. Two fields rather than a returned pair or a
+  // subarray(), because this runs for every header and every argument.
+  private view: Buffer = NO_VIEW;
+  private viewAt = 0;
   private failure: ProtocolError | null = null;
 
   private readonly multibulkOnly: boolean;
@@ -163,9 +172,10 @@ export class RespParser {
         this.big = null;
       } else {
         if (this.buffered < this.bulkLen + 2) return null;
-        const body = this.take(this.bulkLen + 2);
-        expectCrlf(body, this.bulkLen);
-        arg = body.toString('latin1', 0, this.bulkLen);
+        this.consume(this.bulkLen + 2);
+        const at = this.viewAt;
+        expectCrlf(this.view, at + this.bulkLen);
+        arg = this.view.toString('latin1', at, at + this.bulkLen);
       }
       this.argv.push(arg);
       this.bulkLen = -1;
@@ -178,14 +188,15 @@ export class RespParser {
     const cmd = { argv, bytes: this.consumed };
     this.consumed = 0;
     this.argv = [];
+    this.view = NO_VIEW;
     return cmd;
   }
 
   /** `*<n>\r\n`: the count, or null to wait. */
   private multibulkHeader(): number | null {
-    const line = this.headerLine(PROTOCOL.TOO_BIG_MBULK);
-    if (line === null) return null;
-    const n = parseLength(line, 1, line.length - 2);
+    const len = this.headerLine(PROTOCOL.TOO_BIG_MBULK);
+    if (len < 0) return null;
+    const n = parseLength(this.view, this.viewAt + 1, this.viewAt + len - 2);
     if (Number.isNaN(n) || n > MAX_MULTIBULK_LEN)
       throw new ProtocolError(PROTOCOL.INVALID_MULTIBULK);
     if (n > MAX_UNAUTH_MULTIBULK_LEN && this.limits.authRequired()) {
@@ -196,10 +207,12 @@ export class RespParser {
 
   /** `$<len>\r\n`: the length, or null to wait. */
   private bulkHeader(): number | null {
-    const line = this.headerLine(PROTOCOL.TOO_BIG_BULK);
-    if (line === null) return null;
-    if (line[0] !== DOLLAR) throw new ProtocolError(expectedDollar(String.fromCharCode(line[0]!)));
-    const len = parseLength(line, 1, line.length - 2);
+    const lineLen = this.headerLine(PROTOCOL.TOO_BIG_BULK);
+    if (lineLen < 0) return null;
+    const at = this.viewAt;
+    const first = this.view[at]!;
+    if (first !== DOLLAR) throw new ProtocolError(expectedDollar(String.fromCharCode(first)));
+    const len = parseLength(this.view, at + 1, at + lineLen - 2);
     if (Number.isNaN(len) || len < 0 || len > this.limits.maxBulkLen()) {
       throw new ProtocolError(PROTOCOL.INVALID_BULK);
     }
@@ -210,17 +223,18 @@ export class RespParser {
   }
 
   /**
-   * A header line, through its CR and the byte after it. Like Redis, only the CR is looked for
-   * and the next byte is skipped unseen.
+   * Consumes a header line, through its CR and the byte after it, into `view`, and returns its
+   * length; -1 to wait. Like Redis, only the CR is looked for and the next byte is skipped unseen.
    */
-  private headerLine(tooBig: string): Buffer | null {
+  private headerLine(tooBig: string): number {
     const cr = this.find(CR);
     if (cr < 0) {
       if (this.buffered > MAX_INLINE_LEN) throw new ProtocolError(tooBig);
-      return null;
+      return -1;
     }
-    if (this.buffered < cr + 2) return null;
-    return this.take(cr + 2);
+    if (this.buffered < cr + 2) return -1;
+    this.consume(cr + 2);
+    return cr + 2;
   }
 
   /** One inline line split into args (empty for a blank line), or null to wait. */
@@ -255,7 +269,22 @@ export class RespParser {
     return -1;
   }
 
-  /** The next `n` bytes (a view when they sit in one chunk), consumed. */
+  /** Consumes the next `n` bytes and leaves them at view[viewAt…]: in place when they can be. */
+  private consume(n: number): void {
+    const first = this.chunks[this.head]!;
+    if (this.pos + n <= first.length) {
+      this.view = first;
+      this.viewAt = this.pos;
+    } else {
+      const out = Buffer.allocUnsafe(n);
+      this.copyTo(out, 0, n);
+      this.view = out;
+      this.viewAt = 0;
+    }
+    this.advance(n);
+  }
+
+  /** The next `n` bytes (a view when they sit in one chunk), consumed. For inline lines. */
   private take(n: number): Buffer {
     const first = this.chunks[this.head]!;
     let out: Buffer;
