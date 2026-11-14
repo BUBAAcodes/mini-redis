@@ -6,6 +6,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { Config } from '../../src/config.js';
 import { Server } from '../../src/server/server.js';
+import type { ServerOptions } from '../../src/server/server.js';
 
 export interface TestServer {
   server: Server;
@@ -19,6 +20,7 @@ export interface TestServer {
 export async function startServer(
   directives: Record<string, string> = {},
   seed?: number,
+  extra: Partial<ServerOptions> = {},
 ): Promise<TestServer> {
   const ownDir = directives.dir === undefined;
   const dir = directives.dir ?? (await mkdtemp(join(tmpdir(), 'miniredis-test-')));
@@ -32,7 +34,7 @@ export async function startServer(
     ),
   );
   const logs: string[] = [];
-  const server = new Server({ config, log: (line) => logs.push(line), seed });
+  const server = new Server({ config, log: (line) => logs.push(line), seed, ...extra });
   await server.start();
   return {
     server,

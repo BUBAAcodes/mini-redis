@@ -171,6 +171,17 @@ export class Aof implements PropagationSink {
     this.lastDb = -1;
   }
 
+  /** Shutdown's first look (spec 9.14 step 2): fsync what's written, whatever the policy. */
+  syncNow(): void {
+    if (this.closed) return;
+    try {
+      fs.fsyncSync(this.fd);
+      this.fsyncedSize = this.size;
+    } catch (e) {
+      this.server.log.warning(`Error fsyncing the AOF file at shutdown: ${strerror(e)}`);
+    }
+  }
+
   /**
    * Shutdown (spec 9.14 step 2): write what's buffered, fsync whatever the policy, close. A
    * background fsync still running just finds the descriptor gone; its result is ignored.

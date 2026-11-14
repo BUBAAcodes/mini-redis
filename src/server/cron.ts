@@ -9,7 +9,7 @@
  * rewrites, starts BGSAVEs for save points, and runs the primary's replication chores (full
  * syncs waiting for a job, heartbeats, keepalives, replica timeouts and output limits) and, on a
  * replica, its link's (ACKs, reconnects, timeouts). Once a second it closes idle clients and
- * applies soft output limits (limits.ts). Ops/sec sampling (23) joins later.
+ * applies soft output limits (limits.ts). It also samples commands per second for INFO.
  *
  * Mirrors Redis server.c (serverCron, databasesCron).
  */
@@ -71,6 +71,7 @@ export class Cron {
     // Over the limit with no write to trigger it: evict a slice anyway (spec 9.4).
     performEvictions(this.server);
     this.server.updatePeakMemory();
+    this.server.sampleOps(now);
     // A failed AOF write is retried, and the `everysec` fsync started (spec 9.6).
     this.server.aof?.cron();
     // A scheduled or automatic AOF rewrite goes first, as in Redis's serverCron (spec 9.7).

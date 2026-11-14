@@ -4,12 +4,13 @@
  *
  * Key design choice: each section is a function from the Server to its fields, listed in
  * Redis's order, so `INFO a b` and `INFO all` share one code path and print sections in the
- * same order whatever order they were asked for. Step 5 has the fields ioredis and the tests
- * need (`loading:0` is how ioredis knows the server is ready); later steps add theirs (memory,
- * persistence, stats, replication), and step 23 fills in the rest of section 13.1.
+ * same order whatever order they were asked for. `loading:0` is how ioredis knows the server is
+ * ready. A few fields cost a little to compute (avg_ttl samples the expires dict), so they are
+ * evaluated only when their section is asked for.
  *
  * Mirrors Redis server.c (genRedisInfoString, infoCommand).
  */
+import { arch, platform, release } from 'node:os';
 import type { Server } from '../server/server.js';
 import { MINIREDIS_VERSION, REDIS_VERSION } from '../server/version.js';
 
@@ -37,10 +38,32 @@ const SECTIONS: ReadonlyArray<
     (s) => [
       ['redis_version', REDIS_VERSION],
       ['miniredis_version', MINIREDIS_VERSION],
+      ['redis_mode', 'standalone'],
+      ['os', `${platform()} ${release()} ${arch()}`],
+      ['arch_bits', arch().includes('64') || arch() === 's390x' ? 64 : 32],
+      ['process_id', process.pid],
       ['run_id', s.runId],
       ['tcp_port', s.port],
       ['uptime_in_seconds', Math.floor((Date.now() - s.startTime) / 1000)],
+      ['uptime_in_days', Math.floor((Date.now() - s.startTime) / 86_400_000)],
+      ['hz', s.config.get('hz')],
+      ['executable', process.argv[1] ?? ''],
+      ['config_file', s.config.file],
+      ['node_version', process.versions.node],
     ],
+  ],
+  [
+    'clients',
+    'Clients',
+    (s) => {
+      let blocked = 0;
+      for (const c of s.clients.values()) if (c.blocked) blocked++;
+      return [
+        ['connected_clients', s.clients.size],
+        ['blocked_clients', blocked],
+        ['maxclients', s.config.get('maxclients')],
+      ];
+    },
   ],
   [
     'memory',
@@ -78,6 +101,7 @@ const SECTIONS: ReadonlyArray<
       ['aof_rewrite_in_progress', s.snapshotJob?.kind === 'rewrite' ? 1 : 0],
       ['aof_rewrite_scheduled', s.aofRewriteScheduled ? 1 : 0],
       ['aof_last_bgrewrite_status', s.aofLastRewriteStatus],
+      ['aof_last_write_status', (s.aof?.error ?? null) === null ? 'ok' : 'err'],
       ['aof_rewrites', s.aofRewrites],
       // Only while an AOF is open, as Redis prints them only with the AOF on.
       ...((s.aof === null
@@ -91,10 +115,10 @@ const SECTIONS: ReadonlyArray<
   [
     'stats',
     'Stats',
-    // The counters that exist so far, in Redis's order; step 23 fills in the rest.
     (s) => [
       ['total_connections_received', s.stats.totalConnectionsReceived],
       ['total_commands_processed', s.stats.totalCommandsProcessed],
+      ['instantaneous_ops_per_sec', s.instantaneousOps],
       ['rejected_connections', s.stats.rejectedConnections],
       ['sync_full', s.stats.syncFull],
       ['sync_partial_ok', s.stats.syncPartialOk],
@@ -103,9 +127,44 @@ const SECTIONS: ReadonlyArray<
       ['evicted_keys', s.stats.evictedKeys],
       ['keyspace_hits', s.stats.keyspaceHits],
       ['keyspace_misses', s.stats.keyspaceMisses],
+      ['pubsub_channels', s.pubsub.numChannels()],
+      ['pubsub_patterns', s.pubsub.numPat()],
     ],
   ],
   ['replication', 'Replication', (s) => s.repl.infoFields()],
+  [
+    'cpu',
+    'CPU',
+    () => {
+      // process.cpuUsage() is in microseconds.
+      const usage = process.cpuUsage();
+      return [
+        ['used_cpu_sys', (usage.system / 1e6).toFixed(6)],
+        ['used_cpu_user', (usage.user / 1e6).toFixed(6)],
+      ];
+    },
+  ],
+  [
+    'keyspace',
+    'Keyspace',
+    (s) => {
+      const now = Date.now();
+      const fields: Fields = [];
+      for (const db of s.dbs) {
+        if (db.size === 0) continue;
+        // Like Redis, the average TTL is an estimate from a sample of the keys that expire.
+        const sample = db.expires.randomEntries(20);
+        const avgTtl =
+          sample.length === 0
+            ? 0
+            : Math.round(
+                sample.reduce((sum, [, at]) => sum + Math.max(0, at - now), 0) / sample.length,
+              );
+        fields.push([`db${db.id}`, `keys=${db.size},expires=${db.expires.size},avg_ttl=${avgTtl}`]);
+      }
+      return fields;
+    },
+  ],
 ];
 
 /** Words that select every section; Redis's `default` set equals `all` until we have more. */

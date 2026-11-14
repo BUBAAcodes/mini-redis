@@ -36,6 +36,7 @@ import {
   unknownSubcommand,
   wrongArity,
 } from '../protocol/errors.js';
+import { feedMonitors, redactArgv } from '../observability/monitor.js';
 import { inSubscriberMode } from '../pubsub/hub.js';
 import type { Client } from '../server/client.js';
 import type { Server } from '../server/server.js';
@@ -202,7 +203,10 @@ export function call(
   // Who runs it: on a replica, the primary link sees keys the clients see as expired.
   const callerBefore = server.currentClient;
   server.currentClient = client;
+  const startMs = Date.now();
   const start = process.hrtime.bigint();
+  // Before the handler, so CLIENT INFO shows the command it is running (Redis's lastcmd).
+  client.lastCommand = spec.name;
   try {
     spec.handler(ctx);
   } catch (e) {
@@ -218,14 +222,28 @@ export function call(
   }
   const usec = Number(process.hrtime.bigint() - start) / 1000;
 
-  // 9. Stats; SLOWLOG and MONITOR (step 23) also feed from here. A command that blocked is
-  //    counted once, when it's served (it runs again) or times out, as in Redis.
-  //    Replaying the AOF counts nothing, as Redis's loader calls handlers directly.
+  // 9. Stats, SLOWLOG and MONITOR. A command that blocked is counted once, when it's served
+  //    (it runs again) or times out, as in Redis. Replaying the AOF counts nothing, as Redis's
+  //    loader calls handlers directly. The primary's stream isn't shown to monitors or logged
+  //    as slow either: those are for what clients ask.
   if (!server.loading) {
     server.stats.totalCommandsProcessed++;
-    if (!client.blocked) server.recordCommandStats(spec.name, usec);
+    if (!client.blocked) {
+      server.recordCommandStats(spec.name, usec);
+      if (!client.primaryLink) {
+        server.slowlog.pushIfNeeded(
+          server.config.get('slowlog-log-slower-than'),
+          server.config.get('slowlog-max-len'),
+          usec,
+          startMs,
+          redactArgv(spec, argv),
+          client.addr,
+          client.name,
+        );
+        feedMonitors(server, client, spec, argv);
+      }
+    }
   }
-  client.lastCommand = spec.name;
 
   // 10. Propagate: the command's own record only if it's a write that changed something.
   const changed = server.dirty > dirtyBefore && spec.flags.includes('write');

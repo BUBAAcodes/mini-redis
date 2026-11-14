@@ -97,6 +97,11 @@ export class PubSubHub<S extends Subscriber> {
     return this.byChannel.get(channel)?.size ?? 0;
   }
 
+  /** INFO's pubsub_channels: channels with at least one subscriber. */
+  numChannels(): number {
+    return this.byChannel.size;
+  }
+
   /** PUBSUB NUMPAT: distinct patterns in use, not subscriptions. */
   numPat(): number {
     return this.byPattern.size;

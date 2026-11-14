@@ -54,6 +54,29 @@ describe('the miniredis process', () => {
     expect(p.output()).toContain('MiniRedis is now ready to exit, bye bye...');
   });
 
+  it('SIGTERM with save points writes a snapshot that loads after a restart', async () => {
+    const data = join(dir, 'sigterm-data');
+    const args = ['--port', '0', '--dir', data, '--save', '900 1', '--appendonly', 'no'];
+    const first = run(args);
+    const [, port] = await first.waitFor(/Running mode=standalone, port=(\d+)\./);
+    const c = await TestClient.connect(Number(port));
+    expect(await c.call('SET', 'kept', 'yes')).toBe('OK');
+    expect(await c.call('RPUSH', 'l', 'a', 'b')).toBe(2);
+    first.child.kill('SIGTERM');
+    expect(await first.exited).toBe(0);
+    expect(first.output()).toContain('Saving the final RDB snapshot before exiting.');
+    expect(first.output()).toContain('DB saved on disk');
+    expect(first.output()).toContain('MiniRedis is now ready to exit, bye bye...');
+
+    const second = run(args);
+    const [, port2] = await second.waitFor(/Running mode=standalone, port=(\d+)\./);
+    const c2 = await TestClient.connect(Number(port2));
+    expect(await c2.call('GET', 'kept')).toBe('yes');
+    expect(await c2.call('LRANGE', 'l', '0', '-1')).toEqual(['a', 'b']);
+    second.child.kill('SIGTERM');
+    expect(await second.exited).toBe(0);
+  });
+
   it('refuses to start with a bad directive, naming the line', async () => {
     const conf = join(dir, 'bad.conf');
     await writeFile(conf, 'port 0\nmaxmemory lots\n');

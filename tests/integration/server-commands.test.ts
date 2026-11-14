@@ -152,7 +152,7 @@ describe('TIME', () => {
 });
 
 describe('INFO', () => {
-  it('has the step 5 fields, in Redis format', async () => {
+  it('has the server, persistence and replication fields, in Redis format', async () => {
     const info = (await c.call('INFO')) as string;
     expect(info).toMatch(/^# Server\r\n/);
     expect(info).toContain('\r\nredis_version:7.4.0\r\n');
@@ -165,7 +165,9 @@ describe('INFO', () => {
     expect(info).toContain('\r\nrdb_last_bgsave_status:ok\r\n');
     // Step 14's AOF fields close the section; the sizes only appear with the AOF on.
     expect(info).toMatch(/\r\naof_enabled:0\r\n.*\r\naof_rewrites:0\r\n\r\n# Stats\r\n/s);
-    expect(info).toMatch(/\r\n\r\n# Replication\r\nrole:master\r\n.*repl_backlog_histlen:0\r\n$/s);
+    expect(info).toMatch(
+      /\r\n\r\n# Replication\r\nrole:master\r\n.*repl_backlog_histlen:0\r\n\r\n# CPU\r\n/s,
+    );
     expect(info).not.toContain('aof_current_size');
   });
 
@@ -182,10 +184,13 @@ describe('INFO', () => {
     expect(await headers('everything')).toEqual(await headers());
     expect(await headers()).toEqual([
       '# Server',
+      '# Clients',
       '# Memory',
       '# Persistence',
       '# Stats',
       '# Replication',
+      '# CPU',
+      '# Keyspace',
     ]);
   });
 

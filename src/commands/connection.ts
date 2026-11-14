@@ -1,6 +1,6 @@
 /**
  * Connection commands: PING, ECHO, QUIT, SELECT, AUTH, HELLO, RESET and CLIENT (ID, SETNAME,
- * GETNAME, SETINFO, KILL). The rest of CLIENT arrives in step 23.
+ * GETNAME, SETINFO, KILL, LIST, INFO).
  *
  * Key design choice: these only touch the calling client's own state, never the keyspace, so
  * none is a write and none propagates. QUIT doesn't close the socket itself: it sets
@@ -21,6 +21,7 @@
  */
 import { createHash, timingSafeEqual } from 'node:crypto';
 import { ERR, ReplyError, wrongArity } from '../protocol/errors.js';
+import { clientInfoLine } from '../observability/client-info.js';
 import { REDIS_VERSION } from '../server/version.js';
 import { discardTransaction } from './dispatch.js';
 import { parseInt64 } from '../utils/numbers.js';
@@ -198,6 +199,8 @@ export function resetCommand(ctx: CommandContext): void {
   const { client, server } = ctx;
   discardTransaction(client);
   server.pubsub.unsubscribeAll(client);
+  client.monitor = false;
+  server.monitors.delete(client);
   client.db = 0;
   client.name = '';
   client.reply.resp = 2;
@@ -296,6 +299,53 @@ export function clientKillCommand(ctx: CommandContext): void {
   ctx.reply.integer(killed);
 }
 
+/**
+ * `CLIENT LIST [TYPE normal|master|replica|pubsub] [ID id ...]`: one line per client, oldest id
+ * first, as one verbatim string.
+ */
+export function clientListCommand(ctx: CommandContext): void {
+  const { server, argv } = ctx;
+  let type: ClientType | null = null;
+  let ids: Set<number> | null = null;
+  const opt = argv[2]?.toLowerCase();
+  if (opt === 'type' && argv.length === 4) {
+    type = CLIENT_TYPES[argv[3]!.toLowerCase()] ?? null;
+    if (type === null) throw new ReplyError(`ERR Unknown client type '${argv[3]}'`);
+  } else if (opt === 'id' && argv.length >= 4) {
+    ids = new Set();
+    for (const raw of argv.slice(3)) {
+      const id = parseInt64(raw);
+      if (id === null || id <= 0n) throw new ReplyError('ERR Invalid client ID');
+      ids.add(Number(id));
+    }
+  } else if (argv.length !== 2) {
+    throw new ReplyError(ERR.SYNTAX);
+  }
+  const now = Date.now();
+  let text = '';
+  for (const c of server.clients.values()) {
+    if (type !== null && clientType(c) !== type) continue;
+    if (ids !== null && !ids.has(c.id)) continue;
+    text += `${clientInfoLine(c, now)}\n`;
+  }
+  ctx.reply.verbatim(text);
+}
+
+export function clientInfoCommand(ctx: CommandContext): void {
+  ctx.reply.verbatim(`${clientInfoLine(ctx.client)}\n`);
+}
+
+/** MONITOR: this client now sees every non-admin command the others run (spec 13.3). */
+export function monitorCommand(ctx: CommandContext): void {
+  const { client, server } = ctx;
+  if (client.repl !== null) return;
+  if (!client.monitor) {
+    client.monitor = true;
+    server.monitors.add(client);
+  }
+  ctx.reply.ok();
+}
+
 export const connectionCommands: CommandSpec[] = [
   command('ping', -1, [], [0, 0, 0], pingCommand),
   command('echo', 2, [], [0, 0, 0], echoCommand),
@@ -303,6 +353,7 @@ export const connectionCommands: CommandSpec[] = [
   command('select', 2, ['stale'], [0, 0, 0], selectCommand),
   command('auth', -2, ['noauth', 'stale'], [0, 0, 0], authCommand),
   command('hello', -1, ['noauth', 'stale'], [0, 0, 0], helloCommand),
+  command('monitor', 1, ['admin', 'stale'], [0, 0, 0], monitorCommand),
   command('reset', 1, ['noauth', 'stale'], [0, 0, 0], resetCommand),
   command('client', -2, [], [0, 0, 0], containerOnly, [
     command('client|id', 2, ['stale'], [0, 0, 0], clientIdCommand),
@@ -310,5 +361,7 @@ export const connectionCommands: CommandSpec[] = [
     command('client|getname', 2, ['stale'], [0, 0, 0], clientGetnameCommand),
     command('client|setinfo', 4, ['stale'], [0, 0, 0], clientSetinfoCommand),
     command('client|kill', -3, ['admin', 'stale'], [0, 0, 0], clientKillCommand),
+    command('client|list', -2, ['admin', 'stale'], [0, 0, 0], clientListCommand),
+    command('client|info', 2, ['stale'], [0, 0, 0], clientInfoCommand),
   ]),
 ];

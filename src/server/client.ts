@@ -88,6 +88,8 @@ export class Client {
    * CLIENT_MASTER): its commands are obeyed without the checks a user gets, and never answered.
    */
   primaryLink = false;
+  /** In MONITOR mode: it is sent every command other clients run (spec 13.3). */
+  monitor = false;
   /** When its output first passed its class's soft limit; 0 while under it. */
   softLimitSince = 0;
 

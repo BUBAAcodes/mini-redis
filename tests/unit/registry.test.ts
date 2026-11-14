@@ -14,7 +14,7 @@ const handlerName = (name: string): string =>
     .join('') + 'Command';
 
 describe('command table (spec 7.9)', () => {
-  it('has every command built so far (steps 5 to 22)', () => {
+  it('has every command built so far (steps 5 to 23)', () => {
     const names = [...buildCommandTable().keys()].sort();
     expect(names).toEqual(
       [
@@ -76,6 +76,7 @@ describe('command table (spec 7.9)', () => {
         'ltrim',
         'memory',
         'mget',
+        'monitor',
         'mset',
         'multi',
         'object',
@@ -107,10 +108,12 @@ describe('command table (spec 7.9)', () => {
         'select',
         'set',
         'setrange',
+        'shutdown',
         'sinter',
         'sinterstore',
         'sismember',
         'slaveof',
+        'slowlog',
         'smembers',
         'spop',
         'srandmember',

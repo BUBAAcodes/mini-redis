@@ -1,7 +1,7 @@
 /**
  * Server commands: COMMAND (COUNT, INFO), CONFIG (GET, SET, RESETSTAT, HELP), TIME, INFO, the
  * snapshot commands SAVE, BGSAVE and LASTSAVE (step 13), and OBJECT and MEMORY USAGE (step 19).
- * SHUTDOWN, SLOWLOG and MONITOR come later; DEBUG lives in debug.ts.
+ * SLOWLOG and SHUTDOWN (step 23); DEBUG lives in debug.ts, MONITOR in connection.ts.
  *
  * Key design choice: COMMAND INFO is generated from the command table, so it can never
  * disagree with what the dispatcher enforces. COMMAND DOCS is deliberately not a subcommand:
@@ -22,7 +22,8 @@ import { genInfoString } from '../observability/info.js';
 import { saveSnapshot } from '../persistence/snapshot-format.js';
 import { startAofRewrite } from '../persistence/aof-rewrite.js';
 import { startBgsave } from '../persistence/snapshot-job.js';
-import { ERR, ReplyError } from '../protocol/errors.js';
+import { shutdownServer } from '../server/shutdown.js';
+import { ERR, ReplyError, wrongArity } from '../protocol/errors.js';
 import { estimateIdleSeconds, lfuDecrAndReturn, lfuTimeInMinutes } from '../storage/eviction.js';
 import type { RObj } from '../storage/redis-object.js';
 import { parseInt64 } from '../utils/numbers.js';
@@ -359,6 +360,101 @@ export function memoryHelpCommand(ctx: CommandContext): void {
   for (const line of MEMORY_HELP) ctx.reply.simple(line);
 }
 
+const SLOWLOG_HELP = [
+  'SLOWLOG <subcommand> [<arg> [value] [opt] ...]. Subcommands are:',
+  'GET [<count>]',
+  '    Return top <count> entries from the slowlog (default: 10, -1 mean all).',
+  '    Entries are made of:',
+  '    id, timestamp, time in microseconds, arguments array, client IP and port,',
+  '    client name',
+  'LEN',
+  '    Return the length of the slowlog.',
+  'RESET',
+  '    Reset the slowlog.',
+  'HELP',
+  '    Print this help.',
+];
+
+/** `SLOWLOG GET [count]`: newest first; the default is 10, -1 means all. */
+export function slowlogGetCommand(ctx: CommandContext): void {
+  const { argv } = ctx;
+  if (argv.length > 3) throw new ReplyError(wrongArity('slowlog|get'));
+  let count = 10;
+  if (argv.length === 3) {
+    const n = parseInt64(argv[2]!);
+    if (n === null || n < -1n) {
+      throw new ReplyError('ERR count should be greater than or equal to -1');
+    }
+    count = n > BigInt(Number.MAX_SAFE_INTEGER) ? Number.MAX_SAFE_INTEGER : Number(n);
+  }
+  const entries = ctx.server.slowlog.newest(count);
+  ctx.reply.arrayLen(entries.length);
+  for (const e of entries) {
+    ctx.reply.arrayLen(6);
+    ctx.reply.integer(e.id);
+    ctx.reply.integer(e.time);
+    ctx.reply.integer(e.usec);
+    ctx.reply.array(e.argv);
+    ctx.reply.bulk(e.addr);
+    ctx.reply.bulk(e.name);
+  }
+}
+
+export function slowlogLenCommand(ctx: CommandContext): void {
+  ctx.reply.integer(ctx.server.slowlog.length);
+}
+
+export function slowlogResetCommand(ctx: CommandContext): void {
+  ctx.server.slowlog.reset();
+  ctx.reply.ok();
+}
+
+export function slowlogHelpCommand(ctx: CommandContext): void {
+  ctx.reply.arrayLen(SLOWLOG_HELP.length);
+  for (const line of SLOWLOG_HELP) ctx.reply.simple(line);
+}
+
+/**
+ * `SHUTDOWN [NOSAVE|SAVE] [NOW] [FORCE]`: saves per the save points (or SAVE), then stops. On
+ * success there is no reply, only the closing connection, as in Redis; a failed save replies
+ * with the error and the server keeps running. NOW and FORCE only matter to Redis's wait for
+ * replicas and its ignoring of save errors, so they're accepted, and FORCE makes us exit
+ * despite a failed save.
+ */
+export function shutdownCommand(ctx: CommandContext): void {
+  const { argv, server } = ctx;
+  let nosave = false;
+  let save = false;
+  let force = false;
+  for (const raw of argv.slice(1)) {
+    switch (raw.toLowerCase()) {
+      case 'nosave':
+        nosave = true;
+        break;
+      case 'save':
+        save = true;
+        break;
+      case 'now':
+        break;
+      case 'force':
+        force = true;
+        break;
+      default:
+        throw new ReplyError(ERR.SYNTAX);
+    }
+  }
+  if (nosave && save) throw new ReplyError(ERR.SYNTAX);
+  // `nomulti`, so never inside a transaction (as in Redis).
+  server.log.warning('User requested shutdown...');
+  if (shutdownServer(server, { nosave, save })) return;
+  if (force) {
+    server.log.warning('Error trying to save the DB, exit anyway.');
+    shutdownServer(server, { nosave: true });
+    return;
+  }
+  throw new ReplyError('ERR Errors trying to SHUTDOWN. Check logs.');
+}
+
 export const serverCommands: CommandSpec[] = [
   command('command', -1, ['stale'], [0, 0, 0], commandCommand, [
     command('command|count', 2, ['stale'], [0, 0, 0], commandCountCommand),
@@ -372,6 +468,13 @@ export const serverCommands: CommandSpec[] = [
   ]),
   command('time', 1, ['stale'], [0, 0, 0], timeCommand),
   command('info', -1, ['stale'], [0, 0, 0], infoCommand),
+  command('slowlog', -2, [], [0, 0, 0], containerOnly, [
+    command('slowlog|get', -2, ['admin', 'stale'], [0, 0, 0], slowlogGetCommand),
+    command('slowlog|len', 2, ['admin', 'stale'], [0, 0, 0], slowlogLenCommand),
+    command('slowlog|reset', 2, ['admin', 'stale'], [0, 0, 0], slowlogResetCommand),
+    command('slowlog|help', 2, ['stale'], [0, 0, 0], slowlogHelpCommand),
+  ]),
+  command('shutdown', -1, ['admin', 'nomulti', 'stale'], [0, 0, 0], shutdownCommand),
   command('save', 1, ['admin', 'nomulti'], [0, 0, 0], saveCommand),
   command('bgsave', -1, ['admin'], [0, 0, 0], bgsaveCommand),
   command('bgrewriteaof', 1, ['admin'], [0, 0, 0], bgrewriteaofCommand),

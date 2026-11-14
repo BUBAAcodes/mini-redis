@@ -1,7 +1,7 @@
 /**
  * Entry point: `node dist/index.js [miniredis.conf] [--name value ...]`, like redis-server.
  * Reads the config file, applies flags on top, starts the server, and shuts down gracefully
- * on SIGTERM and SIGINT.
+ * on SIGTERM and SIGINT (saving first when save points are configured, spec 9.14).
  *
  * Key design choice: everything that can fail before listening (an unreadable file, a bad
  * directive) is reported the way Redis reports it, as a FATAL CONFIG FILE ERROR naming the
@@ -15,6 +15,7 @@ import type { DirectiveLine } from './config.js';
 import { AofLoadError } from './persistence/aof.js';
 import { SnapshotLoadError } from './persistence/snapshot-format.js';
 import { Server } from './server/server.js';
+import { shutdownServer } from './server/shutdown.js';
 import { MINIREDIS_VERSION } from './server/version.js';
 
 function loadConfig(argv: readonly string[]): Config {
@@ -62,16 +63,14 @@ async function main(): Promise<void> {
     stopping = true;
     server.log.warning(`Received ${signal} scheduling shutdown...`);
     server.log.warning('User requested shutdown...');
-    server.close().then(
-      () => {
-        server.log.warning('MiniRedis is now ready to exit, bye bye...');
-        process.exit(0);
-      },
-      (e: unknown) => {
-        server.log.warning(`Error during shutdown: ${(e as Error).message}`);
-        process.exit(1);
-      },
-    );
+    // Saves first when save points exist; a failed save keeps the server up, as in Redis, so
+    // the next signal tries again.
+    if (!shutdownServer(server)) {
+      server.log.warning(
+        'SIGTERM received but errors trying to shut down the server, check the logs for more information',
+      );
+      stopping = false;
+    }
   };
   process.on('SIGTERM', () => shutdown('SIGTERM'));
   process.on('SIGINT', () => shutdown('SIGINT'));

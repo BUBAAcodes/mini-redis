@@ -64,12 +64,20 @@ export function checkOutputLimits(server: Server, client: Client, now?: number):
 
 /**
  * Closes a client that has said nothing for `timeout` seconds. Not replicas, the link to our
- * primary, clients parked in a blocking command, or subscribers: they are meant to wait
- * (Redis's clientsCronHandleTimeout; MONITOR clients join the exceptions in step 23).
+ * primary, clients parked in a blocking command, subscribers, or MONITOR clients: they are
+ * meant to wait (Redis's clientsCronHandleTimeout).
  */
 function closeIfIdle(server: Server, client: Client, now: number): boolean {
   const timeout = server.config.get('timeout');
-  if (timeout === 0 || client.repl !== null || client.primaryLink || client.blocked) return false;
+  if (
+    timeout === 0 ||
+    client.repl !== null ||
+    client.primaryLink ||
+    client.blocked ||
+    client.monitor
+  ) {
+    return false;
+  }
   if (clientType(client) === 'pubsub') return false;
   if (now - client.lastInteraction <= timeout * 1000) return false;
   server.log.verbose(`Closing idle client: ${client.describe()}`);

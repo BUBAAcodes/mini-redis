@@ -36,6 +36,8 @@ import { loadSnapshotFile, snapshotPath } from '../persistence/snapshot-format.j
 import type { SnapshotJob } from '../persistence/snapshot-job.js';
 import { ERR, ProtocolError } from '../protocol/errors.js';
 import type { ParserLimits } from '../protocol/parser.js';
+import { MetricsServer } from '../observability/metrics-http.js';
+import { SlowLog } from '../observability/slowlog.js';
 import { PubSubHub } from '../pubsub/hub.js';
 import { Replication } from '../replication/primary.js';
 import { PrimaryLink } from '../replication/replica.js';
@@ -61,6 +63,11 @@ export interface ServerOptions {
    * write failing under `appendfsync always`). Exits the process by default; tests observe it.
    */
   fatal?: (message: string) => void;
+  /**
+   * Called with the exit code once SHUTDOWN or a signal has finished stopping the server.
+   * Exits the process by default; tests observe it.
+   */
+  exit?: (code: number) => void;
 }
 
 export interface Stats {
@@ -131,6 +138,16 @@ export class Server {
   stats = newStats();
   /** Per command name ('config|get'), for INFO commandstats and /metrics (step 23). */
   readonly commandStats = new Map<string, CommandStats>();
+  /** SLOWLOG's entries (spec 13.2). */
+  readonly slowlog = new SlowLog();
+  /** Clients in MONITOR mode (spec 13.3). */
+  readonly monitors = new Set<Client>();
+  /** The `/metrics` listener while `metrics-port` is set (spec 13.5). */
+  private metrics: MetricsServer | null = null;
+  /** Recent commands-per-second samples, for INFO's instantaneous_ops_per_sec. */
+  readonly opsSamples: number[] = [];
+  private lastOpsSampleAt = Date.now();
+  private lastOpsSampleCount = 0;
   /** Changes since the last save; signalModifiedKey increments it. */
   dirty = 0;
   /** Unix seconds of the last successful save (LASTSAVE); startup counts, as in Redis. */
@@ -197,6 +214,7 @@ export class Server {
   private shuttingDown = false;
   private detachAof: (() => void) | null = null;
   private readonly onFatal: (message: string) => void;
+  private readonly onExit: (code: number) => void;
   /** The next eviction slice, when the last one ran out of time (Redis's evictionTimeProc). */
   private evictionTimer: NodeJS.Immediate | null = null;
 
@@ -208,6 +226,7 @@ export class Server {
       ...(options.log ? { write: options.log } : {}),
     });
     this.onFatal = options.fatal ?? (() => process.exit(1));
+    this.onExit = options.exit ?? ((code) => process.exit(code));
     this.rng = new Random(options.seed);
     this.dictOptions = { seed: this.rng.uint32(), rng: this.rng };
     this.dbs = Array.from({ length: this.config.get('databases') }, (_, i) => new Db(i, this));
@@ -263,6 +282,12 @@ export class Server {
     this.port = typeof address === 'object' && address !== null ? address.port : 0;
     listener.on('error', (e) => this.log.warning(`Listener error: ${e.message}`));
     this.cron.start();
+    const metricsPort = this.config.get('metrics-port');
+    if (metricsPort > 0) {
+      this.metrics = new MetricsServer(this);
+      await this.metrics.start(metricsPort, this.config.get('bind'));
+      this.log.notice(`Metrics available on port ${metricsPort}`);
+    }
     this.log.notice(`Running mode=standalone, port=${this.port}.`);
     this.log.notice('Server initialized');
     this.log.notice('Ready to accept connections tcp');
@@ -272,8 +297,8 @@ export class Server {
 
   /**
    * Stops accepting, aborts a running snapshot job (deleting its temp file), flushes queued
-   * replies, closes every connection and resolves when all are gone. Saving at shutdown
-   * (spec 9.14 step 3) joins in step 23.
+   * replies, closes every connection and resolves when all are gone. It never saves: SHUTDOWN
+   * and the signals go through shutdownServer (shutdown.ts), which saves first.
    */
   async close(): Promise<void> {
     if (this.shuttingDown) return;
@@ -283,6 +308,8 @@ export class Server {
     if (this.evictionTimer !== null) clearImmediate(this.evictionTimer);
     this.evictionTimer = null;
     this.snapshotJob?.abort('shutdown');
+    this.metrics?.stop();
+    this.metrics = null;
     const listening = this.listener;
     const listenerClosed = new Promise<void>((resolve) => {
       if (listening === null) resolve();
@@ -302,6 +329,35 @@ export class Server {
         }),
     );
     await Promise.all([listenerClosed, ...sockets]);
+  }
+
+  get isShuttingDown(): boolean {
+    return this.shuttingDown;
+  }
+
+  /** Ends the process (or tells the test) once shutdown is complete. */
+  exit(code: number): void {
+    this.onExit(code);
+  }
+
+  /**
+   * serverCron's sample for INFO's instantaneous_ops_per_sec: commands per second since the
+   * last sample, averaged over the last 16 samples, taken at most every 100 ms as in Redis's
+   * trackInstantaneousMetric.
+   */
+  sampleOps(now: number = Date.now()): void {
+    const elapsed = now - this.lastOpsSampleAt;
+    if (elapsed < 100) return;
+    const ops = ((this.stats.totalCommandsProcessed - this.lastOpsSampleCount) * 1000) / elapsed;
+    this.lastOpsSampleAt = now;
+    this.lastOpsSampleCount = this.stats.totalCommandsProcessed;
+    this.opsSamples.push(Math.max(0, ops));
+    if (this.opsSamples.length > 16) this.opsSamples.shift();
+  }
+
+  get instantaneousOps(): number {
+    if (this.opsSamples.length === 0) return 0;
+    return Math.round(this.opsSamples.reduce((a, b) => a + b, 0) / this.opsSamples.length);
   }
 
   /** Logs why the server can't go on, then exits (or tells the test that it would have). */
@@ -392,6 +448,8 @@ export class Server {
   resetStats(): void {
     this.stats = newStats();
     this.commandStats.clear();
+    this.opsSamples.length = 0;
+    this.lastOpsSampleCount = 0;
   }
 
   recordCommandStats(name: string, usec: number): void {
@@ -499,6 +557,7 @@ export class Server {
     this.pubsub.unsubscribeAll(client);
     this.waiters.unblock(client);
     this.unblockedClients.delete(client);
+    this.monitors.delete(client);
     this.repl.freeClient(client);
     if (client.primaryLink) this.primaryLink.linkLost(client);
   }
