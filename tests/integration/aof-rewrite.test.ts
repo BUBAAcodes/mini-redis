@@ -183,6 +183,7 @@ describe('BGREWRITEAOF', () => {
     await c.call('SELECT', '0');
     fillDirect(t, 100_000);
     await c.call('SET', 'ttl', 'v', 'EX', '1000');
+    const ttlSetAt = Date.now();
     expect(await c.call('BGREWRITEAOF')).toBe('Background append only file rewriting started');
     // Written while the rewrite walks: these reach the new file through the rewrite buffer.
     const binary = Array.from({ length: 256 }, (_, i) => String.fromCharCode(i)).join('');
@@ -201,7 +202,10 @@ describe('BGREWRITEAOF', () => {
     const [, c2] = await boot();
     expect(await c2.call('DEBUG', 'DIGEST')).toBe(digest);
     expect(await c2.call('GET', binary)).toBe(binary);
-    expect(Number(await c2.call('TTL', 'ttl'))).toBeGreaterThan(990);
+    // The TTL survived as an absolute time: only the time this test took has passed, however
+    // slow a loaded machine makes it.
+    const elapsed = Math.ceil((Date.now() - ttlSetAt) / 1000);
+    expect(Number(await c2.call('TTL', 'ttl'))).toBeGreaterThanOrEqual(1000 - elapsed - 1);
   });
 
   it('a failing rename keeps the old AOF, which goes on taking writes', async () => {
