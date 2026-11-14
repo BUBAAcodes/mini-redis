@@ -9,6 +9,9 @@
  * fit in one node, so the node count stays near `length / maxItems`. Redis packs each node into
  * a listpack (and can compress it); we keep arrays, because V8 already stores strings compactly.
  *
+ * Memory (spec 10.5): each node keeps the byte count of its items, and the list keeps the total,
+ * so dropping a whole node (LTRIM) or merging two costs O(1), not a walk over their items.
+ *
  * Mirrors Redis quicklist.c (quicklistPush, quicklistPop, quicklistGetIteratorAtIdx,
  * quicklistReplaceAtIndex, _quicklistInsert, _quicklistSplitNode, _quicklistMergeNodes,
  * quicklistDelRange).
@@ -16,10 +19,20 @@
 
 export const QUICKLIST_DEFAULT_MAX_ITEMS = 128;
 
+const sumBytes = (items: readonly string[]): number => {
+  let n = 0;
+  for (const v of items) n += v.length;
+  return n;
+};
+
 class QuicklistNode {
   prev: QuicklistNode | null = null;
   next: QuicklistNode | null = null;
-  constructor(public items: string[]) {}
+  /** Bytes of the items in this node. */
+  bytes: number;
+  constructor(public items: string[]) {
+    this.bytes = sumBytes(items);
+  }
 }
 
 export class Quicklist {
@@ -27,6 +40,7 @@ export class Quicklist {
   private tail: QuicklistNode | null = null;
   private len = 0;
   private nodes = 0;
+  private totalBytes = 0;
 
   constructor(readonly maxItems: number = QUICKLIST_DEFAULT_MAX_ITEMS) {
     if (!Number.isInteger(maxItems) || maxItems < 1) {
@@ -42,17 +56,28 @@ export class Quicklist {
     return this.nodes;
   }
 
+  /** Bytes of all the items: the list's share of a memory estimate. */
+  get bytes(): number {
+    return this.totalBytes;
+  }
+
   pushHead(value: string): void {
     const h = this.head;
-    if (h !== null && h.items.length < this.maxItems) h.items.unshift(value);
-    else this.linkBefore(new QuicklistNode([value]), h);
+    if (h !== null && h.items.length < this.maxItems) {
+      h.items.unshift(value);
+      h.bytes += value.length;
+    } else this.linkBefore(new QuicklistNode([value]), h);
+    this.totalBytes += value.length;
     this.len++;
   }
 
   pushTail(value: string): void {
     const t = this.tail;
-    if (t !== null && t.items.length < this.maxItems) t.items.push(value);
-    else this.linkAfter(new QuicklistNode([value]), t);
+    if (t !== null && t.items.length < this.maxItems) {
+      t.items.push(value);
+      t.bytes += value.length;
+    } else this.linkAfter(new QuicklistNode([value]), t);
+    this.totalBytes += value.length;
     this.len++;
   }
 
@@ -60,6 +85,7 @@ export class Quicklist {
     const h = this.head;
     if (h === null) return undefined;
     const value = h.items.shift()!;
+    this.dropBytes(h, value.length);
     this.len--;
     if (h.items.length === 0) this.unlink(h);
     return value;
@@ -69,6 +95,7 @@ export class Quicklist {
     const t = this.tail;
     if (t === null) return undefined;
     const value = t.items.pop()!;
+    this.dropBytes(t, value.length);
     this.len--;
     if (t.items.length === 0) this.unlink(t);
     return value;
@@ -84,7 +111,9 @@ export class Quicklist {
   set(index: number, value: string): boolean {
     const at = this.locate(index);
     if (at === null) return false;
-    at[0].items[at[1]] = value;
+    const [node, i] = at;
+    this.dropBytes(node, node.items[i]!.length - value.length);
+    node.items[i] = value;
     return true;
   }
 
@@ -113,6 +142,7 @@ export class Quicklist {
     if (node.items.length >= this.maxItems && offset === 0) {
       // Going in front of a full node: a node of its own, so a split never leaves an empty half.
       this.linkBefore(new QuicklistNode([value]), node);
+      this.totalBytes += value.length;
       this.len++;
       return;
     }
@@ -120,6 +150,7 @@ export class Quicklist {
       const half = node.items.length >> 1;
       const right = new QuicklistNode(node.items.slice(half));
       node.items.length = half;
+      node.bytes -= right.bytes;
       this.linkAfter(right, node);
       if (offset >= half) {
         node = right;
@@ -127,6 +158,8 @@ export class Quicklist {
       }
     }
     node.items.splice(offset, 0, value);
+    node.bytes += value.length;
+    this.totalBytes += value.length;
     this.len++;
   }
 
@@ -169,9 +202,10 @@ export class Quicklist {
       if (h.items.length <= fromHead) {
         fromHead -= h.items.length;
         this.len -= h.items.length;
+        this.totalBytes -= h.bytes;
         this.unlink(h);
       } else {
-        h.items.splice(0, fromHead);
+        this.dropBytes(h, sumBytes(h.items.splice(0, fromHead)));
         this.len -= fromHead;
         fromHead = 0;
       }
@@ -181,8 +215,10 @@ export class Quicklist {
       if (t.items.length <= fromTail) {
         fromTail -= t.items.length;
         this.len -= t.items.length;
+        this.totalBytes -= t.bytes;
         this.unlink(t);
       } else {
+        this.dropBytes(t, sumBytes(t.items.slice(t.items.length - fromTail)));
         t.items.length -= fromTail;
         this.len -= fromTail;
         fromTail = 0;
@@ -209,6 +245,7 @@ export class Quicklist {
         for (let i = items.length - 1; i >= 0 && removed < limit; i--) {
           if (items[i] === value) {
             items.splice(i, 1);
+            this.dropBytes(n, value.length);
             removed++;
           }
         }
@@ -216,6 +253,7 @@ export class Quicklist {
         for (let i = 0; i < items.length && removed < limit;) {
           if (items[i] === value) {
             items.splice(i, 1);
+            this.dropBytes(n, value.length);
             removed++;
           } else {
             i++;
@@ -236,6 +274,7 @@ export class Quicklist {
     this.tail = null;
     this.len = 0;
     this.nodes = 0;
+    this.totalBytes = 0;
   }
 
   /**
@@ -245,9 +284,12 @@ export class Quicklist {
   check(): void {
     let count = 0;
     let items = 0;
+    let bytes = 0;
     let prev: QuicklistNode | null = null;
     for (let n = this.head; n !== null; n = n.next) {
       if (n.prev !== prev) throw new Error('quicklist: broken prev link');
+      if (n.bytes !== sumBytes(n.items)) throw new Error('quicklist: node byte count is off');
+      bytes += n.bytes;
       if (n.items.length === 0) throw new Error('quicklist: empty node');
       if (n.items.length > this.maxItems) throw new Error('quicklist: node over maxItems');
       count++;
@@ -257,6 +299,14 @@ export class Quicklist {
     if (prev !== this.tail) throw new Error('quicklist: tail mismatch');
     if (count !== this.nodes) throw new Error(`quicklist: nodeCount ${this.nodes} != ${count}`);
     if (items !== this.len) throw new Error(`quicklist: length ${this.len} != ${items}`);
+    if (bytes !== this.totalBytes)
+      throw new Error(`quicklist: bytes ${this.totalBytes} != ${bytes}`);
+  }
+
+  /** Takes `n` bytes off a node and the total; a negative `n` adds them. */
+  private dropBytes(node: QuicklistNode, n: number): void {
+    node.bytes -= n;
+    this.totalBytes -= n;
   }
 
   /** The node and offset of `index` (negative from the tail), walking from the nearer end. */
@@ -285,12 +335,14 @@ export class Quicklist {
     const p = node.prev;
     if (p !== null && p.items.length + node.items.length <= this.maxItems) {
       for (const v of node.items) p.items.push(v);
+      p.bytes += node.bytes;
       this.unlink(node);
       node = p;
     }
     const nx = node.next;
     if (nx !== null && node.items.length + nx.items.length <= this.maxItems) {
       for (const v of nx.items) node.items.push(v);
+      node.bytes += nx.bytes;
       this.unlink(nx);
     }
   }
@@ -301,6 +353,7 @@ export class Quicklist {
       const nx = n.next;
       if (n.items.length + nx.items.length <= this.maxItems) {
         for (const v of nx.items) n.items.push(v);
+        n.bytes += nx.bytes;
         this.unlink(nx);
       } else {
         n = nx;

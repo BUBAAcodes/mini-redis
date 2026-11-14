@@ -36,6 +36,7 @@ import type { SnapshotJob } from '../persistence/snapshot-job.js';
 import { ProtocolError } from '../protocol/errors.js';
 import { PubSubHub } from '../pubsub/hub.js';
 import { Db } from '../storage/database.js';
+import { EvictionPool, isLfuPolicy, performEvictions } from '../storage/eviction.js';
 import { unwatchAllKeys } from '../storage/watch.js';
 import { Logger } from '../utils/logger.js';
 import { Random } from '../utils/random.js';
@@ -152,6 +153,17 @@ export class Server {
   /** A BGSAVE asked for inside EXEC, started by serverCron once the transaction is over. */
   bgsaveScheduled = false;
 
+  /** `replica` once REPLICAOF follows a primary (step 21): it then ignores `maxmemory`. */
+  role: 'primary' | 'replica' = 'primary';
+  /** True under an LFU policy, when `RObj.lru` holds minutes and a counter (spec 9.4). */
+  lfuEnabled = false;
+  /** Eviction candidates kept between evictions (spec 9.4). */
+  readonly evictionPool = new EvictionPool();
+  /** The db the random policies drew from last: they rotate through the dbs. */
+  evictionNextDb = 0;
+  /** The highest used memory seen (INFO's used_memory_peak). */
+  peakMemory = 0;
+
   /** Served or timed out this turn: their buffered input runs in the next beforeSleep. */
   private readonly unblockedClients = new Set<Client>();
   private nextClientId = 1;
@@ -159,6 +171,8 @@ export class Server {
   private shuttingDown = false;
   private detachAof: (() => void) | null = null;
   private readonly onFatal: (message: string) => void;
+  /** The next eviction slice, when the last one ran out of time (Redis's evictionTimeProc). */
+  private evictionTimer: NodeJS.Immediate | null = null;
 
   constructor(options: ServerOptions = {}) {
     this.config = options.config ?? new Config();
@@ -172,8 +186,17 @@ export class Server {
     this.dictOptions = { seed: this.rng.uint32(), rng: this.rng };
     this.dbs = Array.from({ length: this.config.get('databases') }, (_, i) => new Db(i, this));
     this.cron = new Cron(this);
+    this.lfuEnabled = isLfuPolicy(this.config.get('maxmemory-policy'));
     this.config.onChange((names) => {
       if (names.includes('hz') && this.cron.running) this.cron.start();
+      if (names.includes('maxmemory-policy')) {
+        this.lfuEnabled = isLfuPolicy(this.config.get('maxmemory-policy'));
+        this.evictionPool.clear();
+      }
+      // A lower limit, or a policy that can now evict, takes effect at once, as in Redis.
+      if (names.includes('maxmemory') || names.includes('maxmemory-policy')) {
+        this.scheduleEviction();
+      }
       if (names.includes('appendonly')) {
         // As Redis's updateAppendonly: act only when the state really changes.
         const on = this.config.get('appendonly');
@@ -225,6 +248,8 @@ export class Server {
     if (this.shuttingDown) return;
     this.shuttingDown = true;
     this.cron.stop();
+    if (this.evictionTimer !== null) clearImmediate(this.evictionTimer);
+    this.evictionTimer = null;
     this.snapshotJob?.abort('shutdown');
     const listening = this.listener;
     const listenerClosed = new Promise<void>((resolve) => {
@@ -289,6 +314,31 @@ export class Server {
   queueUnblocked(client: Client): void {
     this.unblockedClients.add(client);
     this.queueReply(client);
+  }
+
+  /** The memory estimate (spec 10.5): every db's running total. */
+  get usedMemory(): number {
+    let total = 0;
+    for (const db of this.dbs) total += db.usedMemory;
+    return total;
+  }
+
+  /** Records a new peak; serverCron and INFO call it, as in Redis. */
+  updatePeakMemory(): void {
+    const used = this.usedMemory;
+    if (used > this.peakMemory) this.peakMemory = used;
+  }
+
+  /**
+   * Runs an eviction slice in the next loop turn: after a slice ran out of time, or the limit
+   * was lowered. At most one is pending, and each slice schedules the next while still over.
+   */
+  scheduleEviction(): void {
+    if (this.evictionTimer !== null || this.shuttingDown) return;
+    this.evictionTimer = setImmediate(() => {
+      this.evictionTimer = null;
+      performEvictions(this);
+    });
   }
 
   resetStats(): void {

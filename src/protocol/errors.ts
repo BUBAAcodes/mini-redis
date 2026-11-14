@@ -62,6 +62,10 @@ export const ERR = {
     'ERR AUTH <password> called without any password configured for the default user. Are you sure your configuration is correct?',
   READONLY: "READONLY You can't write against a read only replica.",
   OOM: "OOM command not allowed when used memory > 'maxmemory'.",
+  OBJECT_FREQ_NOT_LFU:
+    'ERR An LFU maxmemory policy is not selected, access frequency not tracked. Please note that when switching between policies at runtime LRU and LFU data will take some time to adjust.',
+  OBJECT_IDLETIME_LFU:
+    'ERR An LFU maxmemory policy is selected, idle time not tracked. Please note that when switching between policies at runtime LRU and LFU data will take some time to adjust.',
   NOPROTO: 'NOPROTO unsupported protocol version',
   MAX_CLIENTS: 'ERR max number of clients reached',
   DECR_OVERFLOW: 'ERR decrement would overflow',

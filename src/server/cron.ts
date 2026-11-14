@@ -4,14 +4,16 @@
  * Key design choice: one interval timer, re-armed whenever CONFIG SET changes hz, and unref'd
  * so it never keeps a process alive by itself (tests start and stop many servers). Each chore
  * gets a small time budget so cron never becomes a long pause (rule 10). For now it refreshes
- * the LRU clock, expires keys, rehashes, runs the AOF's retries and `everysec` fsync, starts
- * scheduled and automatic AOF rewrites, and starts BGSAVEs for save points; timeouts and output
- * limits (22), replication (20–21) and ops/sec sampling (23) join later.
+ * the LRU clock, expires keys, rehashes, evicts while over `maxmemory` and records the memory
+ * peak, runs the AOF's retries and `everysec` fsync, starts scheduled and automatic AOF
+ * rewrites, and starts BGSAVEs for save points; timeouts and output limits (22), replication
+ * (20–21) and ops/sec sampling (23) join later.
  *
  * Mirrors Redis server.c (serverCron, databasesCron).
  */
 import { aofRewriteCron } from '../persistence/aof-rewrite.js';
 import { snapshotCron } from '../persistence/snapshot-job.js';
+import { performEvictions } from '../storage/eviction.js';
 import { activeExpireCycle } from '../storage/expiry.js';
 import type { Server } from './server.js';
 
@@ -60,6 +62,9 @@ export class Cron {
       activeExpireCycle(this.server, this.interval * ACTIVE_EXPIRE_SHARE);
     }
     for (const db of this.server.dbs) db.cron(REHASH_MS);
+    // Over the limit with no write to trigger it: evict a slice anyway (spec 9.4).
+    performEvictions(this.server);
+    this.server.updatePeakMemory();
     // A failed AOF write is retried, and the `everysec` fsync started (spec 9.6).
     this.server.aof?.cron();
     // A scheduled or automatic AOF rewrite goes first, as in Redis's serverCron (spec 9.7).

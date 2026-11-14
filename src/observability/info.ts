@@ -15,6 +15,19 @@ import { MINIREDIS_VERSION, REDIS_VERSION } from '../server/version.js';
 
 type Fields = Array<[string, string | number]>;
 
+/** Redis's bytesToHuman: `1023B`, `1.00K`, `4.02M`, `3.00G` … */
+export function bytesToHuman(n: number): string {
+  if (n < 1024) return `${n}B`;
+  const units = ['K', 'M', 'G', 'T', 'P'];
+  let value = n / 1024;
+  let unit = 0;
+  while (value >= 1024 && unit < units.length - 1) {
+    value /= 1024;
+    unit++;
+  }
+  return `${value.toFixed(2)}${units[unit]}`;
+}
+
 const SECTIONS: ReadonlyArray<
   readonly [name: string, title: string, fields: (s: Server) => Fields]
 > = [
@@ -28,6 +41,25 @@ const SECTIONS: ReadonlyArray<
       ['tcp_port', s.port],
       ['uptime_in_seconds', Math.floor((Date.now() - s.startTime) / 1000)],
     ],
+  ],
+  [
+    'memory',
+    'Memory',
+    (s) => {
+      s.updatePeakMemory();
+      const used = s.usedMemory;
+      const max = s.config.get('maxmemory');
+      return [
+        // The estimate (spec 10.5), which `maxmemory` is enforced against; RSS is the real cost.
+        ['used_memory', used],
+        ['used_memory_human', bytesToHuman(used)],
+        ['used_memory_rss', process.memoryUsage.rss()],
+        ['used_memory_peak', s.peakMemory],
+        ['maxmemory', max],
+        ['maxmemory_human', bytesToHuman(max)],
+        ['maxmemory_policy', s.config.get('maxmemory-policy')],
+      ];
+    },
   ],
   [
     'persistence',

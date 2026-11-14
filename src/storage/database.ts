@@ -2,9 +2,18 @@
  * Db: one numbered database and the only door to its keys (spec 6.1, rule 5).
  *
  * Key design choice: commands never see the dicts. Every read and change goes through a
- * method here, so lazy expiry, WATCH, blocked-key wakeups, memory accounting (19),
- * the copy-on-write snapshot hook (13) and the dirty counter all hang off a handful of places
- * instead of every command. Each later step fills in its hook where the comments say.
+ * method here, so lazy expiry, WATCH, blocked-key wakeups, memory accounting, LRU/LFU, the
+ * copy-on-write snapshot hook and the dirty counter all hang off a handful of places instead
+ * of every command.
+ *
+ * Memory (spec 10.5): the db keeps a running total of its keys' estimates. Each object
+ * remembers the estimate last counted for it (`memBytes`); inserting, replacing, deleting or
+ * changing a TTL adjusts the total at once, and signalModifiedKey adds the difference after a
+ * command changed a value in place. Every structure counts its own bytes, so this is O(1).
+ *
+ * LRU/LFU (spec 9.4): every lookup but `peek` touches the key: the LRU clock, or under an LFU
+ * policy a decayed and maybe incremented counter. New objects start at the clock, or at the
+ * LFU starting counter; an overwrite under LFU keeps the old counter, as Redis's dbSetValue.
  *
  * Snapshots (spec 9.8): every method that changes or removes an existing key, or its TTL, first
  * hands the old value to a running snapshot job (`beforeChange`), and every object a method
@@ -25,6 +34,8 @@
 import { Dict } from '../datastructures/dict.js';
 import type { Client } from '../server/client.js';
 import type { Server } from '../server/server.js';
+import { lfuInit, lfuTimeInMinutes, lfuTouch } from './eviction.js';
+import { entryBytes } from './memory.js';
 import type { RObj } from './redis-object.js';
 import { touchAllWatchedKeysInDb, touchWatchedKey } from './watch.js';
 import type { WatchedKey } from './watch.js';
@@ -43,6 +54,8 @@ export class Db {
   readonly blockingKeys = new Map<string, Client[]>();
   /** Keys with waiters that changed since blocked clients were last served. */
   readonly readyKeys = new Set<string>();
+  /** The sum of this db's keys' estimates (spec 10.5); the server's used memory adds them up. */
+  usedMemory = 0;
 
   constructor(
     readonly id: number,
@@ -75,7 +88,7 @@ export class Db {
       return null;
     }
     this.server.stats.keyspaceHits++;
-    obj.lru = this.server.lruClock;
+    this.touch(obj);
     return obj;
   }
 
@@ -94,25 +107,30 @@ export class Db {
     const obj = this.dict.get(key);
     if (obj === undefined) return null;
     this.beforeChange(key, obj);
-    obj.lru = this.server.lruClock;
+    this.touch(obj);
     return obj;
   }
 
   /** Adds a key that must not exist yet. */
   add(key: string, obj: RObj): void {
-    obj.lru = this.server.lruClock;
+    this.stampNew(obj);
     this.server.snapshotJob?.stamp(obj);
     if (!this.dict.set(key, obj)) throw new Error(`Db.add: key already exists`);
+    this.account(key, obj);
   }
 
   /** Creates or replaces a key's value; drops its TTL unless `keepTtl`. */
   setKey(key: string, obj: RObj, options?: SetKeyOptions): void {
     const old = this.dict.get(key);
-    if (old !== undefined && old !== obj) this.beforeChange(key, old);
-    obj.lru = this.server.lruClock;
+    if (old !== undefined && old !== obj) {
+      this.beforeChange(key, old);
+      this.unaccount(old);
+    }
+    this.stampNew(obj, old);
     this.server.snapshotJob?.stamp(obj);
     this.dict.set(key, obj);
     if (!options?.keepTtl) this.expires.delete(key);
+    this.account(key, obj);
   }
 
   /** True if the key existed. */
@@ -122,6 +140,7 @@ export class Db {
     this.beforeChange(key, obj);
     this.dict.delete(key);
     this.expires.delete(key);
+    this.unaccount(obj);
     return true;
   }
 
@@ -130,9 +149,10 @@ export class Db {
    * stats or dirty count. `expireAt` is -1 for none. False if the key is already there.
    */
   load(key: string, obj: RObj, expireAt: number): boolean {
-    obj.lru = this.server.lruClock;
+    this.stampNew(obj);
     if (!this.dict.set(key, obj)) return false;
     if (expireAt !== -1) this.expires.set(key, expireAt);
+    this.account(key, obj);
     return true;
   }
 
@@ -145,6 +165,7 @@ export class Db {
     touchAllWatchedKeysInDb(this);
     this._dict = other._dict;
     this._expires = other._expires;
+    this.usedMemory = other.usedMemory;
     for (const key of this.blockingKeys.keys()) {
       if (this._dict.has(key)) this.server.waiters.signalKeyAsReady(this, key);
     }
@@ -161,6 +182,7 @@ export class Db {
     this.delete(from);
     this.dict.set(to, obj);
     if (ttl !== undefined) this.expires.set(to, ttl);
+    this.account(to, obj);
   }
 
   /**
@@ -176,6 +198,7 @@ export class Db {
     const removed = this.dict.size;
     this.dict.clear();
     this.expires.clear();
+    this.usedMemory = 0;
     this.server.dirty += removed;
     return removed;
   }
@@ -224,6 +247,7 @@ export class Db {
     if (obj === undefined) throw new Error('Db.setExpire: key missing');
     this.beforeChange(key, obj);
     this.expires.set(key, ms);
+    this.account(key, obj);
   }
 
   /** True if the key had a TTL. */
@@ -231,7 +255,45 @@ export class Db {
     if (!this.expires.has(key)) return false;
     const obj = this.dict.get(key);
     if (obj !== undefined) this.beforeChange(key, obj);
-    return this.expires.delete(key);
+    this.expires.delete(key);
+    if (obj !== undefined) this.account(key, obj);
+    return true;
+  }
+
+  /** The estimate counted for the key (MEMORY USAGE), or null if it's missing. */
+  memoryUsage(key: string): number | null {
+    return this.peek(key)?.memBytes ?? null;
+  }
+
+  /**
+   * Up to `count` eviction candidates from consecutive buckets after a random start (spec 9.4),
+   * from every key or, for a volatile policy, the keys with a TTL. Expired keys are included:
+   * evicting one is as good as expiring it.
+   */
+  evictionSample(
+    count: number,
+    volatile: boolean,
+  ): Array<{ key: string; obj: RObj; expireAt: number }> {
+    const out: Array<{ key: string; obj: RObj; expireAt: number }> = [];
+    if (volatile) {
+      for (const [key, expireAt] of this.expires.randomEntries(count)) {
+        const obj = this.dict.get(key);
+        if (obj !== undefined) out.push({ key, obj, expireAt });
+      }
+    } else {
+      for (const [key, obj] of this.dict.randomEntries(count)) out.push({ key, obj, expireAt: -1 });
+    }
+    return out;
+  }
+
+  /** For a pool entry that may be stale: still stored (with a TTL, for a volatile policy)? */
+  isEvictionCandidate(key: string, volatile: boolean): boolean {
+    return volatile ? this.expires.has(key) : this.dict.has(key);
+  }
+
+  /** A random key (with a TTL, for volatile-random), or null: for the random policies. */
+  randomEvictionCandidate(volatile: boolean): string | null {
+    return (volatile ? this.expires.randomEntry() : this.dict.randomEntry())?.[0] ?? null;
   }
 
   /** The key's deadline in Unix ms, or -1 for none (or no key). */
@@ -296,6 +358,7 @@ export class Db {
     if (obj !== undefined) this.beforeChange(key, obj);
     this.dict.delete(key);
     this.expires.delete(key);
+    if (obj !== undefined) this.unaccount(obj);
     this.server.stats.expiredKeys++;
     this.server.propagator.propagateNow(this.id, ['DEL', key]);
     touchWatchedKey(this, key);
@@ -312,14 +375,55 @@ export class Db {
 
   /**
    * Called exactly once after a command changes a key: fails the EXEC of every client watching
-   * it, marks it ready for the clients blocked on it, and counts the change for save points and
-   * propagation. Memory accounting (19) joins here. Any change marks a key ready, not just a
-   * push: serving checks that the key holds a list, so an extra mark costs one lookup.
+   * it, marks it ready for the clients blocked on it, counts what an in-place change did to the
+   * memory estimate, and counts the change for save points and propagation. Any change marks a
+   * key ready, not just a push: serving checks that the key holds a list, so an extra mark costs
+   * one lookup.
    */
   signalModifiedKey(key: string): void {
     touchWatchedKey(this, key);
     if (this.blockingKeys.has(key)) this.server.waiters.signalKeyAsReady(this, key);
+    const obj = this.dict.get(key);
+    if (obj !== undefined) this.account(key, obj);
     this.server.dirty++;
+  }
+
+  /** A lookup's touch: the LRU clock, or under an LFU policy one LFU access. */
+  private touch(obj: RObj): void {
+    const server = this.server;
+    if (!server.lfuEnabled) {
+      obj.lru = server.lruClock;
+      return;
+    }
+    const config = server.config;
+    obj.lru = lfuTouch(
+      obj.lru,
+      lfuTimeInMinutes(server.cmdTime),
+      config.get('lfu-log-factor'),
+      config.get('lfu-decay-time'),
+      server.rng,
+    );
+  }
+
+  /** A new object's LRU/LFU field; replacing `old` under LFU keeps its counter. */
+  private stampNew(obj: RObj, old?: RObj): void {
+    const server = this.server;
+    if (!server.lfuEnabled) obj.lru = server.lruClock;
+    else if (old !== undefined) obj.lru = old.lru;
+    else obj.lru = lfuInit(lfuTimeInMinutes(server.cmdTime));
+  }
+
+  /** Recounts the stored key's estimate and adds the difference to the total. */
+  private account(key: string, obj: RObj): void {
+    const bytes = entryBytes(key, obj, this.expires.has(key));
+    this.usedMemory += bytes - obj.memBytes;
+    obj.memBytes = bytes;
+  }
+
+  /** Takes a removed object's estimate back out of the total. */
+  private unaccount(obj: RObj): void {
+    this.usedMemory -= obj.memBytes;
+    obj.memBytes = 0;
   }
 
   /**

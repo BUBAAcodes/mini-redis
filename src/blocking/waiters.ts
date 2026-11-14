@@ -11,6 +11,10 @@
  * the whole EXEC) the dispatcher drains the ready keys. A waiter is only re-run while its key
  * holds a list, so it can't block again, and one that sees another type keeps waiting.
  *
+ * Redis re-runs a served command through processCommand, so its memory check applies again: a
+ * served BLMOVE (denyoom) over `maxmemory` gets -OOM and its source keeps the item, while a
+ * served BLPOP, which frees memory, always runs (checked against redis:7.4).
+ *
  * Timeouts are one Node timer per blocked client (docs/adr/0008-one-timer-per-blocked-client.md).
  * A served or timed-out client's later pipelined input runs from beforeSleep, on a fresh stack,
  * never nested inside the command that woke it.
@@ -25,6 +29,7 @@ import { ERR, ReplyError } from '../protocol/errors.js';
 import type { Client } from '../server/client.js';
 import type { Server } from '../server/server.js';
 import type { Db } from '../storage/database.js';
+import { performEvictions } from '../storage/eviction.js';
 import { parseStrictDouble } from '../utils/numbers.js';
 
 /** LLONG_MAX as a double: every double at or past it is out of int64 range. */
@@ -161,9 +166,17 @@ export class Waiters {
       if (obj === null || obj.type !== 'list') return;
       const { spec, argv } = client.bstate;
       this.unblock(client);
-      call(this.server, client, spec, argv);
+      if (this.deniedOnOom(spec)) client.reply.error(ERR.OOM);
+      else call(this.server, client, spec, argv);
       this.server.queueUnblocked(client);
     }
+  }
+
+  /** The dispatcher's memory check (rule 14), for a command about to be re-run. */
+  private deniedOnOom(spec: CommandSpec): boolean {
+    const server = this.server;
+    if (server.config.get('maxmemory') === 0 || !spec.flags.includes('denyoom')) return false;
+    return performEvictions(server) === 'fail';
   }
 
   private arm(client: Client, state: BlockState): void {

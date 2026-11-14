@@ -12,9 +12,13 @@
  * will abort; one that passes is queued and runs later through call(), the same path as a
  * normal command, so stats and propagation can't differ between the two.
  *
- * The AOF loader's client is obeyed: it skips the client-facing checks (MISCONF, subscriber
- * mode, and later NOAUTH, READONLY and OOM), and while the server loads, call() keeps no stats
+ * The AOF loader's client is obeyed: it skips the client-facing checks (OOM, MISCONF, subscriber
+ * mode, and later NOAUTH and READONLY), and while the server loads, call() keeps no stats
  * and serves no blocked clients, so a replay changes nothing but the data.
+ *
+ * Memory (rule 14): before a `denyoom` command, or an EXEC whose queue holds one, eviction
+ * runs; if the estimate is still over `maxmemory`, the command gets -OOM and nothing changes.
+ * Inside MULTI the check runs when a command is queued and again at EXEC, as in Redis 7.4.
  *
  * Mirrors Redis server.c (processCommand, rejectCommand, call, writeCommandsDeniedByDiskError)
  * and multi.c (queueMultiCommand, flagTransaction, discardTransaction, execCommandAbort).
@@ -31,6 +35,7 @@ import {
 import { inSubscriberMode } from '../pubsub/hub.js';
 import type { Client } from '../server/client.js';
 import type { Server } from '../server/server.js';
+import { performEvictions } from '../storage/eviction.js';
 import { unwatchAllKeys } from '../storage/watch.js';
 import { CommandContext, arityOk, lookupSubcommand } from './command.js';
 import type { CommandSpec } from './command.js';
@@ -80,6 +85,13 @@ export function dispatch(server: Server, client: Client, argv: readonly string[]
     return;
   }
   // 3 joins in step 22: NOAUTH.
+  // 7. Memory, where Redis checks it: ahead of MISCONF, READONLY and subscriber mode.
+  if (server.config.get('maxmemory') > 0 && deniedOnOom(client, spec, top.name)) {
+    if (performEvictions(server) === 'fail') {
+      reject(client, spec, ERR.OOM);
+      return;
+    }
+  }
   // The AOF can't be written: refuse writes, and PING so health checks notice, until a write
   // succeeds. Redis checks this between OOM and READONLY, ahead of subscriber mode.
   const diskError = server.aof?.error ?? null;
@@ -97,13 +109,19 @@ export function dispatch(server: Server, client: Client, argv: readonly string[]
     reject(client, spec, ERR.NOT_ALLOWED_IN_MULTI);
     return;
   }
-  // 6–7 join here: -READONLY on a replica (21), eviction and -OOM for denyoom commands (19).
+  // 6 joins here: -READONLY on a replica (21).
   if (client.multi && !RUN_INSIDE_MULTI.has(top.name)) {
     client.queued.push({ spec, argv });
     client.reply.simple('QUEUED');
     return;
   }
   call(server, client, spec, argv);
+}
+
+/** A denyoom command, or an EXEC whose queue holds one (Redis's is_denyoom_command). */
+function deniedOnOom(client: Client, spec: CommandSpec, name: string): boolean {
+  if (spec.flags.includes('denyoom')) return true;
+  return name === 'exec' && client.queued.some((q) => q.spec.flags.includes('denyoom'));
 }
 
 /** A write, PING, or an EXEC whose queue holds a write (Redis's is_write_command). */

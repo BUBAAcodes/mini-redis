@@ -8,6 +8,9 @@
  * binary, so a key present for the whole scan is returned even if the table resizes between
  * calls.
  *
+ * Memory (spec 10.5): the dict keeps a running count of its key bytes, plus its value bytes
+ * when the values are byte strings (a hash), so a value's size estimate is O(1) per change.
+ *
  * Mirrors Redis dict.c: _dictExpandIfNeeded, dictRehash, dictRehashMicroseconds, dictScan,
  * dictGetRandomKey and dictGetSomeKeys.
  */
@@ -63,6 +66,10 @@ const nextCursor = (v: number, mask: number): number => {
   return rev32(v);
 };
 
+/** Bytes an entry adds to `Dict.bytes`: its key, and its value if that's a byte string. */
+const entryPayload = (key: string, value: unknown): number =>
+  key.length + (typeof value === 'string' ? value.length : 0);
+
 const visitBucket = <V>(t: Table<V>, i: number, fn: (key: string, value: V) => void): void => {
   for (let e = t[i]; e; e = e.next) fn(e.key, e.value);
 };
@@ -77,6 +84,7 @@ export class Dict<V> {
   /** Full walks and scan calls in progress. While > 0: no rehash steps and no changes. */
   private walking = 0;
   private moved = 0;
+  private payload = 0;
   private readonly seed: number;
   private readonly rng: Random;
 
@@ -103,6 +111,11 @@ export class Dict<V> {
     return this.moved;
   }
 
+  /** Key bytes, plus value bytes for byte-string values: the dict's share of a memory estimate. */
+  get bytes(): number {
+    return this.payload;
+  }
+
   /** Sizes of t0 and t1 (0 when not rehashing). */
   tableSizes(): [number, number] {
     return [this.t0.length, this.t1?.length ?? 0];
@@ -125,6 +138,7 @@ export class Dict<V> {
     const h = murmur3_32(key, this.seed);
     const existing = this.find(key, h);
     if (existing) {
+      this.payload += entryPayload(key, value) - entryPayload(key, existing.value);
       existing.value = value;
       return false;
     }
@@ -133,6 +147,7 @@ export class Dict<V> {
     const t = this.t1 ?? this.t0;
     const i = h & (t.length - 1);
     t[i] = { key, value, next: t[i] ?? null };
+    this.payload += entryPayload(key, value);
     if (this.t1) this.used1++;
     else this.used0++;
     return true;
@@ -143,9 +158,11 @@ export class Dict<V> {
     this.assertNotWalking();
     this.step();
     const h = murmur3_32(key, this.seed);
-    if (this.unlink(this.t0, key, h)) this.used0--;
-    else if (this.t1 && this.unlink(this.t1, key, h)) this.used1--;
+    let removed = this.unlink(this.t0, key, h);
+    if (removed !== null) this.used0--;
+    else if (this.t1 && (removed = this.unlink(this.t1, key, h)) !== null) this.used1--;
     else return false;
+    this.payload -= entryPayload(key, removed.value);
     this.finishIfDone();
     this.maybeShrink();
     return true;
@@ -158,6 +175,7 @@ export class Dict<V> {
     this.t1 = null;
     this.used0 = 0;
     this.used1 = 0;
+    this.payload = 0;
     this.rehashIdx = -1;
   }
 
@@ -380,10 +398,13 @@ export class Dict<V> {
       if (this.used0 === 0) fail('t0 is empty but the rehash never finished');
     }
     const seen = new Set<string>();
-    this.forEach((k) => {
+    let payload = 0;
+    this.forEach((k, v) => {
       if (seen.has(k)) fail('a key is stored twice');
       seen.add(k);
+      payload += entryPayload(k, v);
     });
+    if (payload !== this.payload) fail(`bytes is ${this.payload}, the entries hold ${payload}`);
   }
 
   private step(): void {
@@ -398,17 +419,17 @@ export class Dict<V> {
     return null;
   }
 
-  /** Removes key from table t if it's there. Returns true if it was. */
-  private unlink(t: Table<V>, key: string, h: number): boolean {
+  /** Removes key from table t if it's there. Returns the removed entry, or null. */
+  private unlink(t: Table<V>, key: string, h: number): Entry<V> | null {
     const i = h & (t.length - 1);
     let prev: Entry<V> | null = null;
     for (let e = t[i]; e; prev = e, e = e.next) {
       if (e.key !== key) continue;
       if (prev) prev.next = e.next;
       else t[i] = e.next;
-      return true;
+      return e;
     }
-    return false;
+    return null;
   }
 
   private expandIfNeeded(): void {

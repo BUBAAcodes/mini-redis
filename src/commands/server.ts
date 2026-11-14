@@ -1,16 +1,21 @@
 /**
- * Server commands: COMMAND (COUNT, INFO), CONFIG (GET, SET, RESETSTAT, HELP), TIME, INFO, and
- * the snapshot commands SAVE, BGSAVE and LASTSAVE (step 13). SHUTDOWN, SLOWLOG, MONITOR, MEMORY
- * and OBJECT come later; DEBUG lives in debug.ts.
+ * Server commands: COMMAND (COUNT, INFO), CONFIG (GET, SET, RESETSTAT, HELP), TIME, INFO, the
+ * snapshot commands SAVE, BGSAVE and LASTSAVE (step 13), and OBJECT and MEMORY USAGE (step 19).
+ * SHUTDOWN, SLOWLOG and MONITOR come later; DEBUG lives in debug.ts.
  *
  * Key design choice: COMMAND INFO is generated from the command table, so it can never
  * disagree with what the dispatcher enforces. COMMAND DOCS is deliberately not a subcommand:
  * it replies "unknown subcommand", and redis-cli then falls back to its built-in help, as it
  * does with servers older than Redis 7 (spec 8.9).
  *
+ * OBJECT and MEMORY USAGE look keys up with `peek`, so asking about a key never changes its
+ * LRU/LFU data. OBJECT ENCODING is worked out from the value (spec 6.1), with Redis's names
+ * for the encodings we have; MEMORY USAGE replies with the key's estimate (spec 10.5).
+ *
  * Mirrors Redis server.c (commandCommand, commandInfoCommand, addReplyCommandInfo,
  * timeCommand, infoCommand), config.c (configGetCommand, configSetCommand,
- * configHelpCommand) and rdb.c (saveCommand, bgsaveCommand, lastsaveCommand).
+ * configHelpCommand), rdb.c (saveCommand, bgsaveCommand, lastsaveCommand) and object.c
+ * (objectCommand, memoryCommand).
  */
 import type { Reply } from '../protocol/encoder.js';
 import { genInfoString } from '../observability/info.js';
@@ -18,6 +23,9 @@ import { saveSnapshot } from '../persistence/snapshot-format.js';
 import { startAofRewrite } from '../persistence/aof-rewrite.js';
 import { startBgsave } from '../persistence/snapshot-job.js';
 import { ERR, ReplyError } from '../protocol/errors.js';
+import { estimateIdleSeconds, lfuDecrAndReturn, lfuTimeInMinutes } from '../storage/eviction.js';
+import type { RObj } from '../storage/redis-object.js';
+import { parseInt64 } from '../utils/numbers.js';
 import { command, containerOnly, lookupSubcommand } from './command.js';
 import type { CommandContext, CommandFlag, CommandSpec, CommandTable } from './command.js';
 
@@ -236,6 +244,120 @@ export function lastsaveCommand(ctx: CommandContext): void {
   ctx.reply.integer(ctx.server.lastSave);
 }
 
+/** The longest string Redis keeps as embstr (OBJ_ENCODING_EMBSTR_SIZE_LIMIT). */
+const EMBSTR_SIZE_LIMIT = 44;
+
+/**
+ * The encoding Redis would report for this value, minus the compact ones we don't have
+ * (listpack, intset: docs/DIFFERENCES.md). A string is `int` if it reads as a 64-bit integer
+ * in at most 20 characters, as tryObjectEncoding decides.
+ */
+export function objectEncoding(obj: RObj): string {
+  switch (obj.type) {
+    case 'string':
+      if (obj.value.length <= 20 && parseInt64(obj.value) !== null) return 'int';
+      return obj.value.length <= EMBSTR_SIZE_LIMIT ? 'embstr' : 'raw';
+    case 'list':
+      return 'quicklist';
+    case 'hash':
+    case 'set':
+      return 'hashtable';
+    case 'zset':
+      return 'skiplist';
+  }
+}
+
+/** The key's object for OBJECT, or null after replying nil (Redis's objectCommandLookupOrReply). */
+function objectLookup(ctx: CommandContext): RObj | null {
+  const obj = ctx.db.peek(ctx.argv[2]!);
+  if (obj === null) ctx.reply.nullBulk();
+  return obj;
+}
+
+export function objectEncodingCommand(ctx: CommandContext): void {
+  const obj = objectLookup(ctx);
+  if (obj !== null) ctx.reply.bulk(objectEncoding(obj));
+}
+
+export function objectFreqCommand(ctx: CommandContext): void {
+  const obj = objectLookup(ctx);
+  if (obj === null) return;
+  if (!ctx.server.lfuEnabled) throw new ReplyError(ERR.OBJECT_FREQ_NOT_LFU);
+  const now = lfuTimeInMinutes(ctx.server.cmdTime);
+  ctx.reply.integer(lfuDecrAndReturn(obj.lru, now, ctx.server.config.get('lfu-decay-time')));
+}
+
+export function objectIdletimeCommand(ctx: CommandContext): void {
+  const obj = objectLookup(ctx);
+  if (obj === null) return;
+  if (ctx.server.lfuEnabled) throw new ReplyError(ERR.OBJECT_IDLETIME_LFU);
+  ctx.reply.integer(estimateIdleSeconds(obj.lru, ctx.server.lruClock));
+}
+
+/** Values are never shared between keys here, so always 1 (Redis shares small integers). */
+export function objectRefcountCommand(ctx: CommandContext): void {
+  if (objectLookup(ctx) !== null) ctx.reply.integer(1);
+}
+
+const OBJECT_HELP = [
+  'OBJECT <subcommand> [<arg> [value] [opt] ...]. Subcommands are:',
+  'ENCODING <key>',
+  '    Return the kind of internal representation used in order to store the value',
+  '    associated with a <key>.',
+  'FREQ <key>',
+  '    Return the access frequency index of the <key>. The returned integer is',
+  '    proportional to the logarithm of the recent access frequency of the key.',
+  'IDLETIME <key>',
+  '    Return the idle time of the <key>, that is the approximated number of',
+  '    seconds elapsed since the last access to the key.',
+  'REFCOUNT <key>',
+  '    Return the number of references of the value associated with the specified',
+  '    <key>.',
+  'HELP',
+  '    Print this help.',
+];
+
+export function objectHelpCommand(ctx: CommandContext): void {
+  ctx.reply.arrayLen(OBJECT_HELP.length);
+  for (const line of OBJECT_HELP) ctx.reply.simple(line);
+}
+
+/**
+ * `MEMORY USAGE key [SAMPLES count]`. Our estimate is exact for the structures we keep, so
+ * SAMPLES is checked as Redis checks it, then has nothing to do. Options are checked before
+ * the key is looked up, as in Redis.
+ */
+export function memoryUsageCommand(ctx: CommandContext): void {
+  const argv = ctx.argv;
+  for (let j = 3; j < argv.length; j++) {
+    if (argv[j]!.toLowerCase() === 'samples' && j + 1 < argv.length) {
+      const samples = parseInt64(argv[++j]!);
+      if (samples === null) throw new ReplyError(ERR.NOT_INTEGER);
+      if (samples < 0n) throw new ReplyError(ERR.SYNTAX);
+    } else {
+      throw new ReplyError(ERR.SYNTAX);
+    }
+  }
+  const usage = ctx.db.memoryUsage(argv[2]!);
+  if (usage === null) ctx.reply.nullBulk();
+  else ctx.reply.integer(usage);
+}
+
+/** Only the subcommands we have: DOCTOR, MALLOC-STATS, PURGE and STATS are allocator reports. */
+const MEMORY_HELP = [
+  'MEMORY <subcommand> [<arg> [value] [opt] ...]. Subcommands are:',
+  'USAGE <key> [SAMPLES <count>]',
+  '    Return memory in bytes used by <key> and its value. Nested values are',
+  '    sampled up to <count> times (default: 5, 0 means sample all).',
+  'HELP',
+  '    Print this help.',
+];
+
+export function memoryHelpCommand(ctx: CommandContext): void {
+  ctx.reply.arrayLen(MEMORY_HELP.length);
+  for (const line of MEMORY_HELP) ctx.reply.simple(line);
+}
+
 export const serverCommands: CommandSpec[] = [
   command('command', -1, ['stale'], [0, 0, 0], commandCommand, [
     command('command|count', 2, ['stale'], [0, 0, 0], commandCountCommand),
@@ -253,4 +375,15 @@ export const serverCommands: CommandSpec[] = [
   command('bgsave', -1, ['admin'], [0, 0, 0], bgsaveCommand),
   command('bgrewriteaof', 1, ['admin'], [0, 0, 0], bgrewriteaofCommand),
   command('lastsave', 1, ['stale'], [0, 0, 0], lastsaveCommand),
+  command('object', -2, [], [0, 0, 0], containerOnly, [
+    command('object|encoding', 3, ['readonly'], [2, 2, 1], objectEncodingCommand),
+    command('object|freq', 3, ['readonly'], [2, 2, 1], objectFreqCommand),
+    command('object|idletime', 3, ['readonly'], [2, 2, 1], objectIdletimeCommand),
+    command('object|refcount', 3, ['readonly'], [2, 2, 1], objectRefcountCommand),
+    command('object|help', 2, ['stale'], [0, 0, 0], objectHelpCommand),
+  ]),
+  command('memory', -2, [], [0, 0, 0], containerOnly, [
+    command('memory|usage', -3, ['readonly'], [2, 2, 1], memoryUsageCommand),
+    command('memory|help', 2, ['stale'], [0, 0, 0], memoryHelpCommand),
+  ]),
 ];

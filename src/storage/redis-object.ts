@@ -1,6 +1,7 @@
 /**
- * RObj: the value stored under a key (spec 6.1), a type tag plus the value and two fields the
- * server keeps per key: the LRU/LFU clock and the snapshot marker.
+ * RObj: the value stored under a key (spec 6.1), a type tag plus the value and the fields the
+ * server keeps per key: the LRU/LFU clock, the snapshot marker and the memory estimate last
+ * counted for it (spec 10.5; one number here instead of a second dict of key → estimate).
  *
  * Key design choice: a discriminated union on `type`, so a handler that checked `obj.type`
  * gets the right value type with no casts. Encodings (embstr, int, quicklist …) are never
@@ -24,6 +25,11 @@ interface RObjBase {
   lru: number;
   /** Which snapshot job last saw this object (spec 9.8); 0 until snapshots exist. */
   savedEpoch: number;
+  /**
+   * The estimate (spec 10.5) its db last counted for this key, value and TTL. `Db` keeps it so
+   * a change adds only the difference to the running total, and a delete takes it all back.
+   */
+  memBytes: number;
 }
 
 export interface StringObject extends RObjBase {
@@ -65,6 +71,7 @@ export const createStringObject = (value: string): StringObject => ({
   value,
   lru: 0,
   savedEpoch: 0,
+  memBytes: 0,
 });
 
 /** An empty list; `maxItems` is `list-max-node-items`. The caller adds the first item. */
@@ -73,6 +80,7 @@ export const createListObject = (maxItems: number): ListObject => ({
   value: new Quicklist(maxItems),
   lru: 0,
   savedEpoch: 0,
+  memBytes: 0,
 });
 
 export const createHashObject = (options: DictOptions): HashObject => ({
@@ -80,6 +88,7 @@ export const createHashObject = (options: DictOptions): HashObject => ({
   value: new Dict<string>(options),
   lru: 0,
   savedEpoch: 0,
+  memBytes: 0,
 });
 
 export const createSetObject = (options: DictOptions): SetObject => ({
@@ -87,6 +96,7 @@ export const createSetObject = (options: DictOptions): SetObject => ({
   value: new Dict<true>(options),
   lru: 0,
   savedEpoch: 0,
+  memBytes: 0,
 });
 
 /** `rng` draws the skip list's node levels: the server's, so a seeded test replays. */
@@ -95,4 +105,5 @@ export const createZsetObject = (options: DictOptions, rng: Random): ZSetObject 
   value: new ZSet(options, rng),
   lru: 0,
   savedEpoch: 0,
+  memBytes: 0,
 });
