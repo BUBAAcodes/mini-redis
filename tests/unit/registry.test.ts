@@ -14,11 +14,12 @@ const handlerName = (name: string): string =>
     .join('') + 'Command';
 
 describe('command table (spec 7.9)', () => {
-  it('has every command built so far (steps 5 to 21)', () => {
+  it('has every command built so far (steps 5 to 22)', () => {
     const names = [...buildCommandTable().keys()].sort();
     expect(names).toEqual(
       [
         'append',
+        'auth',
         'bgrewriteaof',
         'bgsave',
         'blmove',
@@ -45,6 +46,7 @@ describe('command table (spec 7.9)', () => {
         'getex',
         'getrange',
         'hdel',
+        'hello',
         'hexists',
         'hget',
         'hgetall',
@@ -92,6 +94,7 @@ describe('command table (spec 7.9)', () => {
         'rename',
         'replconf',
         'replicaof',
+        'reset',
         'role',
         'rpop',
         'rpush',

@@ -44,7 +44,7 @@ const until = async (cond: () => Promise<boolean> | boolean): Promise<void> => {
   throw new Error('condition never became true');
 };
 
-/** Makes the server treat `client` as speaking RESP3 (HELLO arrives in step 22). */
+/** Makes the server treat `client` as speaking RESP3 (a shortcut; HELLO 3 does the same). */
 async function useResp3(client: TestClient): Promise<void> {
   const id = (await client.call('CLIENT', 'ID')) as number;
   t.server.clients.get(id)!.reply.resp = 3;

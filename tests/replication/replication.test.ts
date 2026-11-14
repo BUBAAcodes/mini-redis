@@ -203,4 +203,20 @@ describe('replication (spec 15.7)', () => {
     expect(await r2.c.call('LLEN', 'list')).toBe(201);
     expect(await r2.c.call('DEBUG', 'DIGEST')).toBe(await r1.c.call('DEBUG', 'DIGEST'));
   });
+  it('a password-protected primary: the replica links with masterauth, and not without it', async () => {
+    const p = await node({ requirepass: 'sekret' });
+    await p.c.call('AUTH', 'sekret');
+    await p.c.call('SET', 'k', 'v');
+    const good = await node({ masterauth: 'sekret' });
+    await good.c.call('REPLICAOF', '127.0.0.1', String(p.t.port));
+    await until(async () => (await info(good.c, 'replication')).master_link_status === 'up');
+    expect(await p.c.call('WAIT', '1', '5000')).toBe(1);
+    expect(await good.c.call('GET', 'k')).toBe('v');
+
+    const bad = await node({ masterauth: 'wrong' });
+    await bad.c.call('REPLICAOF', '127.0.0.1', String(p.t.port));
+    await sleep(1500);
+    expect((await info(bad.c, 'replication')).master_link_status).toBe('down');
+    expect(await bad.c.call('GET', 'k')).toBe(null);
+  });
 });

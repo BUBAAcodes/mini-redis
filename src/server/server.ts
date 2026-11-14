@@ -34,7 +34,7 @@ import { startAppendOnly, stopAppendOnly } from '../persistence/aof-rewrite.js';
 import { removeLeftoverTemps } from '../persistence/files.js';
 import { loadSnapshotFile, snapshotPath } from '../persistence/snapshot-format.js';
 import type { SnapshotJob } from '../persistence/snapshot-job.js';
-import { ProtocolError } from '../protocol/errors.js';
+import { ERR, ProtocolError } from '../protocol/errors.js';
 import type { ParserLimits } from '../protocol/parser.js';
 import { PubSubHub } from '../pubsub/hub.js';
 import { Replication } from '../replication/primary.js';
@@ -47,6 +47,7 @@ import { Random } from '../utils/random.js';
 import { Client } from './client.js';
 import { Cron, lruClockNow } from './cron.js';
 import { EventLoop } from './event-loop.js';
+import { checkOutputLimits } from './limits.js';
 import { Propagator } from './propagate.js';
 
 export interface ServerOptions {
@@ -107,6 +108,9 @@ export class Server {
     requestAcks: () => this.repl.requestAcks(),
     writeAof: () => this.aof?.flush(),
     writeReplicas: () => this.repl.writeReplicas(),
+    afterWrite: (client) => {
+      checkOutputLimits(this, client);
+    },
   });
   readonly propagator = new Propagator(() => this.eventLoop.scheduleBeforeSleep());
   /** Replication ID and offset, the backlog, the replicas and WAIT (spec 9.13). */
@@ -404,6 +408,14 @@ export class Server {
       socket.destroy();
       return;
     }
+    // Over maxclients: say why and close, before the connection costs a Client (Redis's
+    // acceptCommonHandler). A Redis client library shows the reason instead of a bare reset.
+    if (this.clients.size >= this.config.get('maxclients')) {
+      this.stats.rejectedConnections++;
+      socket.on('error', () => {});
+      socket.end(`-${ERR.MAX_CLIENTS}\r\n`, () => socket.destroy());
+      return;
+    }
     socket.setNoDelay(true);
     const keepalive = this.config.get('tcp-keepalive');
     if (keepalive > 0) socket.setKeepAlive(true, keepalive * 1000);
@@ -411,6 +423,7 @@ export class Server {
       maxBulkLen: () => this.config.get('proto-max-bulk-len'),
       authRequired: (): boolean => !client.authenticated,
     });
+    client.authenticated = this.config.get('requirepass') === '';
     this.clients.set(client.id, client);
     this.stats.totalConnectionsReceived++;
     socket.on('data', (chunk: Buffer) => this.onData(client, chunk));

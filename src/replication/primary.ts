@@ -41,6 +41,7 @@ import { timerDelay } from '../blocking/waiters.js';
 import type { CommandContext } from '../commands/command.js';
 import type { Client } from '../server/client.js';
 import type { PropagationRecord, PropagationSink } from '../server/propagate.js';
+import { enforceOutputLimit } from '../server/limits.js';
 import type { Server } from '../server/server.js';
 import { ReplicationBacklog } from './backlog.js';
 
@@ -516,26 +517,9 @@ export class Replication implements PropagationSink {
     return link.outBytes + link.pendingBytes + (client.socket?.writableLength ?? 0);
   }
 
-  /**
-   * The `replica` class of client-output-buffer-limit (step 22 adds the other classes): past
-   * the hard limit at once, past the soft one for longer than its seconds. True if it closed.
-   */
+  /** The `replica` class of client-output-buffer-limit, over everything queued for the link. */
   private checkOutputLimits(client: Client, now: number): boolean {
-    const limit = this.server.config.get('client-output-buffer-limit').replica;
-    const used = this.outputBytes(client);
-    const hard = limit.hard > 0 && used >= limit.hard;
-    let soft = limit.soft > 0 && used >= limit.soft;
-    if (!soft) client.softLimitSince = 0;
-    else if (client.softLimitSince === 0) {
-      client.softLimitSince = now;
-      soft = false;
-    } else if (now - client.softLimitSince <= limit.softSeconds * 1000) soft = false;
-    if (!hard && !soft) return false;
-    this.server.log.warning(
-      `Client ${client.describe()} scheduled to be closed ASAP for overcoming of output buffer limits.`,
-    );
-    this.server.killClient(client);
-    return true;
+    return enforceOutputLimit(this.server, client, this.outputBytes(client), now);
   }
 
   /** The client is gone: forget it as a replica and as a WAIT client. */

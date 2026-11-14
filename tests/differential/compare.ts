@@ -9,16 +9,30 @@
 import type { Exchange, RespValue } from '../helpers/resp-client.js';
 
 /** Replies whose element order is unspecified, so they are compared as sorted lists. */
-const UNORDERED = new Set(['keys', 'smembers', 'sinter', 'sunion', 'sdiff', 'hkeys', 'hvals']);
+const UNORDERED = new Set([
+  'keys',
+  'smembers',
+  'sinter',
+  'sunion',
+  'sdiff',
+  'hkeys',
+  'hvals',
+  'spop',
+  'srandmember',
+]);
 /** Replies that are flat field/value pairs in unspecified order: compared as sorted pairs. */
 const UNORDERED_PAIRS = new Set(['hgetall']);
 
 const TTL_TOLERANCE: Record<string, number> = { ttl: 1, pttl: 100 };
 
 const asText = (v: RespValue): string =>
-  JSON.stringify(v, (_k, x) => (typeof x === 'bigint' ? `${x}n` : x));
+  JSON.stringify(v, (_k, x) =>
+    typeof x === 'bigint' ? `${x}n` : x instanceof Map ? { map: [...x.entries()] } : x,
+  );
 
 function sortedItems(v: RespValue, pairs: boolean): string[] | null {
+  // RESP3 sends HGETALL as a map; its entries are the pairs a RESP2 array lists flat.
+  if (v instanceof Map) return pairs ? [...v.entries()].map(asText).sort() : null;
   if (!Array.isArray(v)) return null;
   if (!pairs) return v.map(asText).sort();
   const out: string[] = [];

@@ -188,7 +188,7 @@ describe('HSCAN', () => {
   });
 });
 
-/** A client switched to RESP3 on the server side (HELLO arrives in step 22). */
+/** A client switched to RESP3 on the server side (a shortcut; HELLO 3 does the same). */
 async function resp3Client(): Promise<TestClient> {
   const r3 = await TestClient.connect(t.port);
   const id = (await r3.call('CLIENT', 'ID')) as number;

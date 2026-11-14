@@ -13,7 +13,7 @@
  */
 import type { Client } from './client.js';
 
-/** What beforeSleep runs, in this order (spec 9.1 step 5), before the client replies. */
+/** What beforeSleep runs, in this order (spec 9.1 step 5): the hooks, then the replies. */
 export interface BeforeSleepHooks {
   /** The input of clients unblocked this turn, so their replies join this flush. */
   beforeWrites?: () => void;
@@ -23,6 +23,8 @@ export interface BeforeSleepHooks {
   writeAof?: () => void;
   /** The turn's stream bytes, and anything else queued, to the replicas. */
   writeReplicas?: () => void;
+  /** After a client's replies were handed to its socket: the output buffer limits. */
+  afterWrite?: (client: Client) => void;
 }
 
 export class EventLoop {
@@ -60,9 +62,13 @@ export class EventLoop {
     hooks.requestAcks?.();
     hooks.writeAof?.();
     hooks.writeReplicas?.();
-    for (const client of this.pendingWrites) writeClient(client);
+    for (const client of this.pendingWrites) {
+      writeClient(client);
+      // Whatever the socket couldn't take is now in Node's queue: a client that doesn't read
+      // is measured here, in the turn it falls behind.
+      if (!client.closed) hooks.afterWrite?.(client);
+    }
     this.pendingWrites.clear();
-    // Output buffer limits (step 22) are enforced here.
   }
 }
 

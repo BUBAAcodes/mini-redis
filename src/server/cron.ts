@@ -8,8 +8,8 @@
  * peak, runs the AOF's retries and `everysec` fsync, starts scheduled and automatic AOF
  * rewrites, starts BGSAVEs for save points, and runs the primary's replication chores (full
  * syncs waiting for a job, heartbeats, keepalives, replica timeouts and output limits) and, on a
- * replica, its link's (ACKs, reconnects, timeouts). Client timeouts and other output limits
- * (22) and ops/sec sampling (23) join later.
+ * replica, its link's (ACKs, reconnects, timeouts). Once a second it closes idle clients and
+ * applies soft output limits (limits.ts). Ops/sec sampling (23) joins later.
  *
  * Mirrors Redis server.c (serverCron, databasesCron).
  */
@@ -17,6 +17,7 @@ import { aofRewriteCron } from '../persistence/aof-rewrite.js';
 import { snapshotCron } from '../persistence/snapshot-job.js';
 import { performEvictions } from '../storage/eviction.js';
 import { activeExpireCycle } from '../storage/expiry.js';
+import { clientsCron } from './limits.js';
 import type { Server } from './server.js';
 
 /** Spec 7.5: Unix seconds in 24 bits, as Redis's LRU_CLOCK(). */
@@ -33,6 +34,8 @@ export class Cron {
   private timer: NodeJS.Timeout | null = null;
   /** Runs so far; lets later chores run every N ticks (Redis's run_with_period). */
   ticks = 0;
+  /** Unix ms of the last clients pass. */
+  private lastClientsCron = 0;
 
   constructor(private readonly server: Server) {}
 
@@ -58,6 +61,7 @@ export class Cron {
 
   tick(): void {
     this.ticks++;
+    const now = Date.now();
     this.server.lruClock = lruClockNow();
     // Not on a replica: its keys go only when its primary sends DEL (spec 9.3).
     if (this.server.activeExpireEnabled && this.server.role === 'primary') {
@@ -77,5 +81,10 @@ export class Cron {
     // its link's: ACKs, reconnects and timeouts.
     this.server.repl.cron();
     this.server.primaryLink.cron();
+    // Idle timeouts and soft output limits, once a second like Redis's clientsCron.
+    if (now - this.lastClientsCron >= 1000) {
+      this.lastClientsCron = now;
+      clientsCron(this.server, now);
+    }
   }
 }

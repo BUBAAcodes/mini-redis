@@ -1,6 +1,5 @@
-# CI (spec section 17). Suites that need a built server or a long run join as
-# their steps land: fuzz (step 22). The docker build joined in step 5, the
-# differential suite in step 8, the crash suite in step 15, replication in step 21.
+# CI (spec section 17). The docker build joined in step 5, the differential suite in
+# step 8, the crash suite in step 15, replication in step 21, the fuzzer in step 22.
 name: CI
 
 on:
@@ -37,10 +36,18 @@ jobs:
       - run: npm run test:diff
         env:
           OPS: '20000'
+      # The same run with both connections in RESP3 (step 22).
+      - run: npm run test:diff
+        env:
+          OPS: '20000'
+          PROTO: '3'
       - run: npm run test:crash
         env:
           KILLS: '10'
       - run: npm run test:repl
+      - run: npm run test:fuzz
+        env:
+          CASES: '100000'
       - uses: actions/upload-artifact@v4
         if: always()
         with:

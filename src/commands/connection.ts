@@ -1,19 +1,28 @@
 /**
- * Connection commands: PING, ECHO, QUIT, SELECT and CLIENT (ID, SETNAME, GETNAME, SETINFO,
- * KILL). HELLO, AUTH and the rest of CLIENT arrive in steps 22 and 23.
+ * Connection commands: PING, ECHO, QUIT, SELECT, AUTH, HELLO, RESET and CLIENT (ID, SETNAME,
+ * GETNAME, SETINFO, KILL). The rest of CLIENT arrives in step 23.
  *
  * Key design choice: these only touch the calling client's own state, never the keyspace, so
  * none is a write and none propagates. QUIT doesn't close the socket itself: it sets
  * closeAfterReply, so its +OK goes out in the same beforeSleep write as every reply before it.
  *
+ * AUTH and HELLO ... AUTH share one password check: both sides are hashed with SHA-256 and the
+ * digests compared with timingSafeEqual, so neither the length nor any prefix of the password
+ * shows in the time it takes (spec 12). We have no ACL users: "default" is the only one, and
+ * with no `requirepass` it accepts any password, as Redis's `nopass` default user does.
+ *
  * CLIENT KILL is the exception: it closes other connections, through Server.killClient. A
  * client killing itself still gets its reply first (closeAfterReply), as in Redis.
  *
- * Mirrors Redis server.c (pingCommand, echoCommand), db.c (selectCommand) and networking.c
- * (clientCommand, clientSetNameOrReply, clientSetinfoCommand, clientKillCommand,
- * getClientType, getClientTypeByName).
+ * Mirrors Redis server.c (pingCommand, echoCommand, helloCommand, resetCommand,
+ * clearClientConnectionState), db.c (selectCommand), acl.c (authCommand, ACLAuthenticateUser)
+ * and networking.c (clientCommand, clientSetNameOrReply, clientSetinfoCommand,
+ * clientKillCommand, getClientType, getClientTypeByName).
  */
+import { createHash, timingSafeEqual } from 'node:crypto';
 import { ERR, ReplyError, wrongArity } from '../protocol/errors.js';
+import { REDIS_VERSION } from '../server/version.js';
+import { discardTransaction } from './dispatch.js';
 import { parseInt64 } from '../utils/numbers.js';
 import { inSubscriberMode } from '../pubsub/hub.js';
 import type { Client } from '../server/client.js';
@@ -65,10 +74,15 @@ export function clientIdCommand(ctx: CommandContext): void {
   ctx.reply.integer(ctx.client.id);
 }
 
-export function clientSetnameCommand(ctx: CommandContext): void {
-  const name = ctx.argv[2]!;
+/** Throws unless `name` is a legal CLIENT SETNAME / HELLO SETNAME value. */
+function checkClientName(name: string): void {
   if (!validClientAttr(name))
     throw new ReplyError('ERR Client names cannot contain spaces, newlines or special characters.');
+}
+
+export function clientSetnameCommand(ctx: CommandContext): void {
+  const name = ctx.argv[2]!;
+  checkClientName(name);
   ctx.client.name = name;
   ctx.reply.ok();
 }
@@ -92,7 +106,106 @@ export function clientSetinfoCommand(ctx: CommandContext): void {
   ctx.reply.ok();
 }
 
-/** The class a client counts as, for CLIENT KILL TYPE and the output limits (step 22). */
+// ---------------------------------------------------------------- AUTH, HELLO, RESET
+
+const sha256 = (s: string): Buffer => createHash('sha256').update(s, 'latin1').digest();
+
+/**
+ * True if `user` and `pass` get a client in. Both comparisons always run, so a wrong user name
+ * takes as long as a wrong password.
+ */
+function credentialsOk(requirepass: string, user: string, pass: string): boolean {
+  const userOk = user === 'default';
+  const passOk = requirepass === '' || timingSafeEqual(sha256(pass), sha256(requirepass));
+  return userOk && passOk;
+}
+
+export function authCommand(ctx: CommandContext): void {
+  const { argv, client, server } = ctx;
+  if (argv.length > 3) throw new ReplyError(ERR.SYNTAX);
+  const requirepass = server.config.get('requirepass');
+  // The one-word form has no user to blame: with no password set it's a mistake worth reporting.
+  if (argv.length === 2 && requirepass === '') throw new ReplyError(ERR.AUTH_NOT_CONFIGURED);
+  const user = argv.length === 3 ? argv[1]! : 'default';
+  if (!credentialsOk(requirepass, user, argv[argv.length - 1]!))
+    throw new ReplyError(ERR.WRONGPASS);
+  client.authenticated = true;
+  ctx.reply.ok();
+}
+
+const NOAUTH_HELLO =
+  'NOAUTH HELLO must be called with the client already authenticated, otherwise the HELLO <proto> AUTH <user> <pass> option can be used to authenticate the client and select the RESP protocol version at the same time';
+
+/**
+ * `HELLO [2|3 [AUTH user pass] [SETNAME name]]`. Checked in the order the reference Redis 7.4
+ * answers: version, option syntax, the name, the credentials, and only then is anything
+ * changed. So a failing HELLO leaves the protocol, the name and the authentication as they
+ * were (rule 4), and a bad name beats a wrong password.
+ */
+export function helloCommand(ctx: CommandContext): void {
+  const { argv, client, server } = ctx;
+  let ver: 2 | 3 | null = null;
+  let next = 1;
+  if (argv.length >= 2) {
+    const n = parseInt64(argv[1]!);
+    if (n === null) throw new ReplyError('ERR Protocol version is not an integer or out of range');
+    if (n < 2n || n > 3n) throw new ReplyError(ERR.NOPROTO);
+    ver = Number(n) as 2 | 3;
+    next = 2;
+  }
+  let credentials: [user: string, pass: string] | null = null;
+  let name: string | null = null;
+  for (let j = next; j < argv.length; j++) {
+    const more = argv.length - 1 - j;
+    const option = argv[j]!.toLowerCase();
+    if (option === 'auth' && more >= 2) {
+      credentials = [argv[j + 1]!, argv[j + 2]!];
+      j += 2;
+    } else if (option === 'setname' && more >= 1) {
+      name = argv[j + 1]!;
+      j += 1;
+    } else {
+      throw new ReplyError(`ERR Syntax error in HELLO option '${argv[j]!}'`);
+    }
+  }
+  if (name !== null) checkClientName(name);
+  if (credentials !== null) {
+    if (!credentialsOk(server.config.get('requirepass'), credentials[0], credentials[1]))
+      throw new ReplyError(ERR.WRONGPASS);
+  } else if (!client.authenticated) {
+    throw new ReplyError(NOAUTH_HELLO);
+  }
+  // Nothing can fail from here on.
+  if (credentials !== null) client.authenticated = true;
+  if (name !== null) client.name = name;
+  if (ver !== null) client.reply.resp = ver;
+  ctx.reply.map([
+    ['server', 'redis'],
+    ['version', REDIS_VERSION],
+    ['proto', client.reply.resp],
+    ['id', client.id],
+    ['mode', 'standalone'],
+    ['role', server.role === 'replica' ? 'replica' : 'master'],
+    ['modules', []],
+  ]);
+}
+
+/**
+ * Back to a just-connected client (Redis's clearClientConnectionState): out of MULTI, WATCH
+ * and subscriptions, db 0, RESP2, no name, and logged out if a password is required.
+ */
+export function resetCommand(ctx: CommandContext): void {
+  const { client, server } = ctx;
+  discardTransaction(client);
+  server.pubsub.unsubscribeAll(client);
+  client.db = 0;
+  client.name = '';
+  client.reply.resp = 2;
+  client.authenticated = server.config.get('requirepass') === '';
+  ctx.reply.simple('RESET');
+}
+
+/** The class a client counts as, for CLIENT KILL TYPE and the output limits. */
 export type ClientType = 'normal' | 'replica' | 'pubsub' | 'master';
 
 /** Redis's getClientType: the link to our primary first, then replicas, then subscribers. */
@@ -188,6 +301,9 @@ export const connectionCommands: CommandSpec[] = [
   command('echo', 2, [], [0, 0, 0], echoCommand),
   command('quit', -1, ['noauth'], [0, 0, 0], quitCommand),
   command('select', 2, ['stale'], [0, 0, 0], selectCommand),
+  command('auth', -2, ['noauth', 'stale'], [0, 0, 0], authCommand),
+  command('hello', -1, ['noauth', 'stale'], [0, 0, 0], helloCommand),
+  command('reset', 1, ['noauth', 'stale'], [0, 0, 0], resetCommand),
   command('client', -2, [], [0, 0, 0], containerOnly, [
     command('client|id', 2, ['stale'], [0, 0, 0], clientIdCommand),
     command('client|setname', 3, ['stale'], [0, 0, 0], clientSetnameCommand),

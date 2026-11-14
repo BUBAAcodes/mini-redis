@@ -43,7 +43,10 @@ export class Client {
   libVer = '';
   /** Index of the selected database. */
   db = 0;
-  /** AUTH arrives in step 22; until then every client counts as authenticated. */
+  /**
+   * False from connecting until AUTH (or HELLO ... AUTH) succeeds, while `requirepass` is set;
+   * Server.accept sets it. Clients with no socket and the primary link are always trusted.
+   */
   authenticated = true;
   /** Set by QUIT and protocol errors: send what's queued, then close; read nothing more. */
   closeAfterReply = false;

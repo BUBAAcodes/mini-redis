@@ -13,7 +13,7 @@
  * normal command, so stats and propagation can't differ between the two.
  *
  * The AOF loader's client and a replica's primary link are obeyed: they skip the client-facing
- * checks (OOM, MISCONF, READONLY, subscriber mode, and later NOAUTH), since their commands
+ * checks (NOAUTH, OOM, MISCONF, READONLY, subscriber mode), since their commands
  * already ran once. While the server loads, call() keeps no stats and serves no blocked
  * clients, so a replay changes nothing but the data.
  *
@@ -44,7 +44,7 @@ import { unwatchAllKeys } from '../storage/watch.js';
 import { CommandContext, arityOk, lookupSubcommand } from './command.js';
 import type { CommandSpec } from './command.js';
 
-/** What a RESP2 client with subscriptions may run (spec 9.11); RESET joins in step 22. */
+/** What a RESP2 client with subscriptions may run (spec 9.11). */
 const SUBSCRIBER_COMMANDS = new Set([
   'subscribe',
   'psubscribe',
@@ -52,10 +52,11 @@ const SUBSCRIBER_COMMANDS = new Set([
   'punsubscribe',
   'ping',
   'quit',
+  'reset',
 ]);
 
 /** The commands that run at once inside MULTI instead of being queued (spec 9.1 step 5). */
-const RUN_INSIDE_MULTI = new Set(['exec', 'discard', 'multi', 'watch', 'quit']);
+const RUN_INSIDE_MULTI = new Set(['exec', 'discard', 'multi', 'watch', 'quit', 'reset']);
 
 export function dispatch(server: Server, client: Client, argv: readonly string[]): void {
   // 1. Look up the command, then its subcommand.
@@ -88,7 +89,12 @@ export function dispatch(server: Server, client: Client, argv: readonly string[]
     else call(server, client, spec, argv);
     return;
   }
-  // 3 joins in step 22: NOAUTH.
+  // 3. With requirepass set, an unauthenticated client may only run `noauth` commands. After
+  //    the lookup and arity checks, as in Redis, so a typo still says "unknown command".
+  if (!client.authenticated && !spec.flags.includes('noauth')) {
+    reject(client, spec, ERR.NOAUTH);
+    return;
+  }
   // 7. Memory, where Redis checks it: ahead of MISCONF, READONLY and subscriber mode.
   if (server.config.get('maxmemory') > 0 && deniedOnOom(client, spec, top.name)) {
     if (performEvictions(server) === 'fail') {

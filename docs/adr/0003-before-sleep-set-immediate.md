@@ -18,4 +18,4 @@ Handlers only append to the client's `Reply` (its output queue). Any code that q
 - The AOF write in step 12 slots in before the reply loop, and rule 8 holds by construction.
 - A command's reply goes out on the same turn it ran. Nothing waits for a timer, so latency doesn't grow.
 - Timers and cron run in other phases. They must call `scheduleBeforeSleep()` themselves when they queue anything (a timed-out BLPOP, a replica PING), or their output waits for the next socket event.
-- Replies are built as strings and joined once per turn. A client that asks for a huge reply holds it all in memory until beforeSleep. The output buffer limits (step 22) are enforced at that point.
+- Replies are built as strings and joined once per turn. A client that asks for a huge reply holds it all in memory until beforeSleep. The output buffer limits are enforced right after that write (ADR 0016).
