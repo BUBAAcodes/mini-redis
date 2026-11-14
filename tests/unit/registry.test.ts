@@ -14,11 +14,12 @@ const handlerName = (name: string): string =>
     .join('') + 'Command';
 
 describe('command table (spec 7.9)', () => {
-  it('has every command built so far (steps 5 to 18)', () => {
+  it('has every command built so far (steps 5 to 18 and 13)', () => {
     const names = [...buildCommandTable().keys()].sort();
     expect(names).toEqual(
       [
         'append',
+        'bgsave',
         'blmove',
         'blpop',
         'brpop',
@@ -59,6 +60,7 @@ describe('command table (spec 7.9)', () => {
         'incrbyfloat',
         'info',
         'keys',
+        'lastsave',
         'lindex',
         'linsert',
         'llen',
@@ -87,6 +89,7 @@ describe('command table (spec 7.9)', () => {
         'rpop',
         'rpush',
         'sadd',
+        'save',
         'scan',
         'scard',
         'sdiff',

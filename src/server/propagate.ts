@@ -5,7 +5,9 @@
  * and receive exact `{ db, argv }` records in the order changes happened; none are attached
  * yet, and tests attach a recording sink. A handler shapes its own record through three
  * helpers: rewritePropagation() replaces it (SET … EX → SET … PXAT), alsoPropagate() emits
- * other records instead of it (SPOP → SREM), and preventPropagation() drops it. Spec 9.5 lists
+ * other records instead of it (SPOP → SREM), and preventPropagation() drops it. A fourth,
+ * forcePropagation(), sends the command even if `dirty` didn't grow: FLUSHALL, whose save of
+ * the empty dataset resets the counter (Redis's forceCommandPropagation). Spec 9.5 lists
  * all three as "unless", so alsoPropagate() replaces the command as it arrived; that differs
  * from Redis, where the handler must also call preventCommandPropagation(). Each sink adds
  * SELECT itself when a record's db differs from the last one it wrote.
@@ -43,6 +45,7 @@ export class Propagator {
   private also: PropagationRecord[] = [];
   private rewritten: readonly string[] | null = null;
   private prevented = false;
+  private forced = false;
   /** Records held back while an EXEC runs; null outside one. */
   private transaction: PropagationRecord[] | null = null;
   /** True while the AOF loads: every record is dropped. */
@@ -62,6 +65,7 @@ export class Propagator {
     this.also = [];
     this.rewritten = null;
     this.prevented = false;
+    this.forced = false;
   }
 
   rewrite(argv: readonly string[]): void {
@@ -76,6 +80,10 @@ export class Propagator {
     this.prevented = true;
   }
 
+  force(): void {
+    this.forced = true;
+  }
+
   /**
    * Emits a record at once, ahead of the running command's own: a lazy-expiry DEL found during
    * a command (step 7) must replay before the command that found it.
@@ -86,12 +94,13 @@ export class Propagator {
 
   /**
    * After the handler. `changed` is true for a `write` command that grew `server.dirty`: only
-   * those propagate their own (or rewritten) record. Records from alsoPropagate() always go.
+   * those (and forced ones) propagate their own (or rewritten) record. Records from
+   * alsoPropagate() always go.
    */
   end(db: number, argv: readonly string[], changed: boolean): void {
     if (this.also.length > 0) {
       for (const record of this.also) this.emit(record);
-    } else if (changed && !this.prevented) {
+    } else if ((changed || this.forced) && !this.prevented) {
       this.emit({ db, argv: this.rewritten ?? argv });
     }
     this.begin();

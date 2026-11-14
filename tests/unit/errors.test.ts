@@ -73,6 +73,8 @@ describe('error strings (spec 7.4, checked against redis:7.4)', () => {
       INTERNAL: 'ERR internal error',
       NOT_ALLOWED_IN_MULTI: 'ERR Command not allowed inside a transaction',
       AOF_LOAD_FAILED: 'ERR Error trying to load the AOF files, check server logs.',
+      RDB_LOAD_FAILED: 'ERR Error trying to load the RDB dump, check server logs.',
+      BARE: 'ERR',
     });
   });
 

@@ -29,7 +29,17 @@ const SECTIONS: ReadonlyArray<
       ['uptime_in_seconds', Math.floor((Date.now() - s.startTime) / 1000)],
     ],
   ],
-  ['persistence', 'Persistence', () => [['loading', 0]]],
+  [
+    'persistence',
+    'Persistence',
+    (s) => [
+      ['loading', 0],
+      ['rdb_changes_since_last_save', s.dirty],
+      ['rdb_bgsave_in_progress', s.snapshotJob?.kind === 'bgsave' ? 1 : 0],
+      ['rdb_last_save_time', s.lastSave],
+      ['rdb_last_bgsave_status', s.lastBgsaveStatus],
+    ],
+  ],
 ];
 
 /** Words that select every section; Redis's `default` set equals `all` until we have more. */

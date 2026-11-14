@@ -1,6 +1,6 @@
 /**
- * DEBUG (spec 8.9): DIGEST, DIGEST-VALUE, LOADAOF, SLEEP and SET-ACTIVE-EXPIRE so far; RELOAD
- * joins with snapshots (step 13). Refused unless `enable-debug-command yes`.
+ * DEBUG (spec 8.9): DIGEST, DIGEST-VALUE, RELOAD, LOADAOF, SLEEP and SET-ACTIVE-EXPIRE. Refused
+ * unless `enable-debug-command yes`.
  *
  * Key design choice: DEBUG DIGEST is our own fingerprint of the dataset: the XOR of one SHA-1
  * per key, taken over (db, key, type, value, deadline). Every field is length-prefixed, so no
@@ -19,6 +19,7 @@ import { createHash } from 'node:crypto';
 import type { Hash } from 'node:crypto';
 import { formatDouble } from '../protocol/encoder.js';
 import { reloadAof } from '../persistence/aof.js';
+import { reloadSnapshot } from '../persistence/snapshot-format.js';
 import { ERR, ReplyError, unknownSubcommand } from '../protocol/errors.js';
 import type { Server } from '../server/server.js';
 import type { RObj } from '../storage/redis-object.js';
@@ -125,6 +126,8 @@ const DEBUG_HELP = [
   '    Output a hex signature of the values of all the specified keys.',
   'LOADAOF',
   '    Flush the AOF buffers on disk and reload the AOF in memory.',
+  'RELOAD',
+  '    Save the snapshot on disk and reload it back to memory.',
   'SET-ACTIVE-EXPIRE <0|1>',
   '    Setting it to 0 disables expiring keys in background when they are not accessed',
   '    (otherwise the Redis behavior). Setting it to 1 reenables back the default.',
@@ -148,6 +151,12 @@ export function debugCommand(ctx: CommandContext): void {
   } else if (sub === 'digest-value') {
     ctx.reply.arrayLen(argc - 2);
     for (let i = 2; i < argc; i++) ctx.reply.simple(valueDigest(ctx.db.peek(ctx.argv[i]!)));
+  } else if (sub === 'reload' && argc === 2) {
+    // Redis's replies: a bare -ERR when the save fails, its load-error text when loading does.
+    const result = reloadSnapshot(ctx.server);
+    if (result === 'save-failed') throw new ReplyError(ERR.BARE);
+    if (result === 'load-failed') throw new ReplyError(ERR.RDB_LOAD_FAILED);
+    ctx.reply.ok();
   } else if (sub === 'loadaof' && argc === 2) {
     // As in Redis: the data is emptied first, so a missing or damaged file leaves only what
     // loaded before the damage, and the reply says to look at the logs.

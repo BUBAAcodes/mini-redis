@@ -22,7 +22,7 @@ const CRLF = '\r\n';
 const oneLine = (s: string): string => s.replace(/[\r\n]/g, ' ');
 
 /** "WRONGTYPE …", "ERR …": an all-caps first word is the error code. */
-const HAS_CODE = /^[A-Z]+ /;
+const HAS_CODE = /^[A-Z]+(?: |$)/;
 
 export class Reply {
   /** May change mid-connection (HELLO 3); every later element uses the new version. */

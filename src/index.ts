@@ -13,6 +13,7 @@ import { readFileSync } from 'node:fs';
 import { Config, ConfigError, parseArgv, parseConfigFile } from './config.js';
 import type { DirectiveLine } from './config.js';
 import { AofLoadError } from './persistence/aof.js';
+import { SnapshotLoadError } from './persistence/snapshot-format.js';
 import { Server } from './server/server.js';
 import { MINIREDIS_VERSION } from './server/version.js';
 
@@ -78,8 +79,9 @@ async function main(): Promise<void> {
   try {
     await server.start();
   } catch (e) {
-    // A damaged AOF was already logged with its offset; never start empty over it (spec 9.9).
-    if (!(e instanceof AofLoadError)) {
+    // A damaged AOF or snapshot was already logged with its offset; never start empty over it
+    // (spec 9.9).
+    if (!(e instanceof AofLoadError || e instanceof SnapshotLoadError)) {
       const what =
         (e as NodeJS.ErrnoException).syscall === 'listen'
           ? `Failed listening on port ${config.get('port')}`

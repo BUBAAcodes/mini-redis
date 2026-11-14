@@ -6,6 +6,12 @@
  * the copy-on-write snapshot hook (13) and the dirty counter all hang off a handful of places
  * instead of every command. Each later step fills in its hook where the comments say.
  *
+ * Snapshots (spec 9.8): every method that changes or removes an existing key, or its TTL, first
+ * hands the old value to a running snapshot job (`beforeChange`), and every object a method
+ * inserts is stamped with the job's epoch, so the job saves each key exactly once, as it was
+ * when the job started. `lookupWrite` counts as a change: its caller is about to mutate the
+ * object in place.
+ *
  * Expiry: every lookup, `peek` included, first deletes the key if `server.cmdTime` is past its
  * deadline, so no command can see an expired value (rule 7). The deletion is propagated as
  * `DEL key` at once, ahead of the running command's own record (spec 9.5), but it doesn't count
@@ -29,10 +35,8 @@ export interface SetKeyOptions {
 }
 
 export class Db {
-  /** key → object. Private in spirit: commands must go through the methods (rule 5). */
-  readonly dict: Dict<RObj>;
-  /** key → expiry in Unix ms. */
-  readonly expires: Dict<number>;
+  private _dict: Dict<RObj>;
+  private _expires: Dict<number>;
   /** WATCH registry: key → its watchers, each with its entry (storage/watch.ts). */
   readonly watched = new Map<string, Map<Client, WatchedKey>>();
   /** key → clients blocked on it, oldest first (blocking/waiters.ts). */
@@ -44,8 +48,18 @@ export class Db {
     readonly id: number,
     private readonly server: Server,
   ) {
-    this.dict = new Dict<RObj>(server.dictOptions);
-    this.expires = new Dict<number>(server.dictOptions);
+    this._dict = new Dict<RObj>(server.dictOptions);
+    this._expires = new Dict<number>(server.dictOptions);
+  }
+
+  /** key → object. Private in spirit: commands must go through the methods (rule 5). */
+  get dict(): Dict<RObj> {
+    return this._dict;
+  }
+
+  /** key → expiry in Unix ms. */
+  get expires(): Dict<number> {
+    return this._expires;
   }
 
   get size(): number {
@@ -71,11 +85,15 @@ export class Db {
     return this.dict.get(key) ?? null;
   }
 
-  /** For writes: no hit/miss stats, as in Redis. The copy-on-write hook (step 13) goes here. */
+  /**
+   * For writes: no hit/miss stats, as in Redis. The caller may change the object in place, so a
+   * running snapshot saves it first.
+   */
   lookupWrite(key: string): RObj | null {
     this.expireIfNeeded(key);
     const obj = this.dict.get(key);
     if (obj === undefined) return null;
+    this.beforeChange(key, obj);
     obj.lru = this.server.lruClock;
     return obj;
   }
@@ -83,21 +101,53 @@ export class Db {
   /** Adds a key that must not exist yet. */
   add(key: string, obj: RObj): void {
     obj.lru = this.server.lruClock;
+    this.server.snapshotJob?.stamp(obj);
     if (!this.dict.set(key, obj)) throw new Error(`Db.add: key already exists`);
   }
 
   /** Creates or replaces a key's value; drops its TTL unless `keepTtl`. */
   setKey(key: string, obj: RObj, options?: SetKeyOptions): void {
+    const old = this.dict.get(key);
+    if (old !== undefined && old !== obj) this.beforeChange(key, old);
     obj.lru = this.server.lruClock;
+    this.server.snapshotJob?.stamp(obj);
     this.dict.set(key, obj);
     if (!options?.keepTtl) this.expires.delete(key);
   }
 
   /** True if the key existed. */
   delete(key: string): boolean {
-    if (!this.dict.delete(key)) return false;
+    const obj = this.dict.get(key);
+    if (obj === undefined) return false;
+    this.beforeChange(key, obj);
+    this.dict.delete(key);
     this.expires.delete(key);
     return true;
+  }
+
+  /**
+   * For loaders filling a fresh Db (a snapshot, a replica's full sync): inserts with no hooks,
+   * stats or dirty count. `expireAt` is -1 for none. False if the key is already there.
+   */
+  load(key: string, obj: RObj, expireAt: number): boolean {
+    obj.lru = this.server.lruClock;
+    if (!this.dict.set(key, obj)) return false;
+    if (expireAt !== -1) this.expires.set(key, expireAt);
+    return true;
+  }
+
+  /**
+   * Takes `other`'s keys and TTLs as this db's own: DEBUG RELOAD and startup swap in a loaded
+   * snapshot this way. Watchers of keys that were stored see a change, as after a flush, and
+   * clients blocked on a key that now exists are woken. A running job must have been aborted.
+   */
+  replaceData(other: Db): void {
+    touchAllWatchedKeysInDb(this);
+    this._dict = other._dict;
+    this._expires = other._expires;
+    for (const key of this.blockingKeys.keys()) {
+      if (this._dict.has(key)) this.server.waiters.signalKeyAsReady(this, key);
+    }
   }
 
   /** Moves `from`'s value (and TTL) to `to`, replacing whatever `to` held. Both are checked by RENAME. */
@@ -105,6 +155,8 @@ export class Db {
     const obj = this.dict.get(from);
     if (obj === undefined) throw new Error('Db.rename: source key missing');
     const ttl = this.expires.get(from);
+    // Both deletes run the snapshot hook, so a running job saves both keys as they were; the
+    // object then moves already stamped, and the walk won't save it again under its new name.
     this.delete(to);
     this.delete(from);
     this.dict.set(to, obj);
@@ -113,10 +165,13 @@ export class Db {
 
   /**
    * Empties the db and returns how many keys it held, which all count as changes for save
-   * points. Watchers are touched first, while the keys they watch can still be seen. The
-   * snapshot hook (step 13) goes here.
+   * points. Watchers are touched first, while the keys they watch can still be seen. A snapshot
+   * still walking is aborted (spec 9.8): saving every key here through the hook would be one
+   * long pause (rule 10).
    */
   flush(): number {
+    const job = this.server.snapshotJob;
+    if (job !== null && job.walking && this.dict.size > 0) job.abort('the dataset was flushed');
     touchAllWatchedKeysInDb(this);
     const removed = this.dict.size;
     this.dict.clear();
@@ -165,12 +220,17 @@ export class Db {
 
   /** Sets the key's deadline in Unix ms. The key must exist. */
   setExpire(key: string, ms: number): void {
-    if (!this.dict.has(key)) throw new Error('Db.setExpire: key missing');
+    const obj = this.dict.get(key);
+    if (obj === undefined) throw new Error('Db.setExpire: key missing');
+    this.beforeChange(key, obj);
     this.expires.set(key, ms);
   }
 
   /** True if the key had a TTL. */
   removeExpire(key: string): boolean {
+    if (!this.expires.has(key)) return false;
+    const obj = this.dict.get(key);
+    if (obj !== undefined) this.beforeChange(key, obj);
     return this.expires.delete(key);
   }
 
@@ -232,11 +292,22 @@ export class Db {
    * running command's record. No dirty++ (see the header), but watchers see the deletion.
    */
   private deleteExpired(key: string): void {
+    const obj = this.dict.get(key);
+    if (obj !== undefined) this.beforeChange(key, obj);
     this.dict.delete(key);
     this.expires.delete(key);
     this.server.stats.expiredKeys++;
     this.server.propagator.propagateNow(this.id, ['DEL', key]);
     touchWatchedKey(this, key);
+  }
+
+  /**
+   * The copy-on-write hook (spec 9.8): before `obj`, still stored under `key`, changes or goes,
+   * a running snapshot that hasn't saved it yet writes it now, with its TTL, as it was when the
+   * job started. A no-op when no job is walking, or once this object is saved.
+   */
+  private beforeChange(key: string, obj: RObj): void {
+    this.server.snapshotJob?.save(this, key, obj);
   }
 
   /**

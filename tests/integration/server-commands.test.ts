@@ -162,12 +162,13 @@ describe('INFO', () => {
     expect(info).toContain(`\r\ntcp_port:${t.port}\r\n`);
     expect(info).toMatch(/\r\nuptime_in_seconds:\d+\r\n/);
     expect(info).toContain('\r\n\r\n# Persistence\r\nloading:0\r\n');
-    expect(info.endsWith('loading:0\r\n')).toBe(true);
+    expect(info).toMatch(/\r\nrdb_last_bgsave_status:ok\r\n$/);
   });
 
   it('selects sections, case-insensitively, in Redis order', async () => {
     const persistence = (await c.call('INFO', 'PERSISTENCE')) as string;
-    expect(persistence).toBe('# Persistence\r\nloading:0\r\n');
+    expect(persistence).toMatch(/^# Persistence\r\nloading:0\r\nrdb_changes_since_last_save:/);
+    expect(persistence).not.toContain('# Server');
     const both = (await c.call('INFO', 'persistence', 'server')) as string;
     expect(both.indexOf('# Server')).toBeLessThan(both.indexOf('# Persistence'));
     expect(await c.raw('INFO', 'nosuch')).toBe('$0\r\n\r\n');

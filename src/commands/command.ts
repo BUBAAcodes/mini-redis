@@ -69,6 +69,11 @@ export class CommandContext {
   preventPropagation(): void {
     this.server.propagator.prevent();
   }
+
+  /** Propagate the command even if it changed nothing that `dirty` counts (spec 9.5). */
+  forcePropagation(): void {
+    this.server.propagator.force();
+  }
 }
 
 /** Builds a top-level spec. `keys` is [first, last, step]; [0, 0, 0] for no keys. */

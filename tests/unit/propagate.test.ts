@@ -64,6 +64,16 @@ describe('Propagator (spec 9.5)', () => {
     expect(records).toEqual([]);
   });
 
+  it('forcePropagation emits a command that changed nothing dirty counts, once', () => {
+    const { p, records } = setup();
+    p.begin();
+    p.force();
+    p.end(0, ['FLUSHALL'], false);
+    p.begin();
+    p.end(0, ['FLUSHALL'], false);
+    expect(records).toEqual([{ db: 0, argv: ['FLUSHALL'] }]);
+  });
+
   it('propagateNow goes ahead of the running command', () => {
     const { p, records } = setup();
     p.begin();

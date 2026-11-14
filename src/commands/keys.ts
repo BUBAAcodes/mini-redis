@@ -17,6 +17,7 @@
  * db.c/cluster.c flushdbCommand and flushallCommand, and expire.c (expireGenericCommand,
  * parseExtendedExpireArgumentsOrReply, ttlGenericCommand, persistCommand).
  */
+import { saveSnapshot } from '../persistence/snapshot-format.js';
 import { ERR, ReplyError, invalidExpireTime, unsupportedOption } from '../protocol/errors.js';
 import type { RObj } from '../storage/redis-object.js';
 import { stringMatch } from '../utils/glob.js';
@@ -112,18 +113,25 @@ function checkFlushArgs(ctx: CommandContext): void {
 
 export function flushdbCommand(ctx: CommandContext): void {
   checkFlushArgs(ctx);
-  // A running snapshot job must be aborted here (step 13); an empty db changes and propagates
-  // nothing, as in Redis.
+  // Db.flush aborts a snapshot still walking; an empty db changes and propagates nothing, as
+  // in Redis.
   ctx.db.flush();
   ctx.reply.ok();
 }
 
 export function flushallCommand(ctx: CommandContext): void {
   checkFlushArgs(ctx);
-  let removed = 0;
-  for (const db of ctx.server.dbs) removed += db.flush();
-  // Redis forces FLUSHALL into the AOF and replicas even when every db was already empty.
-  if (removed === 0) ctx.server.dirty++;
+  const server = ctx.server;
+  for (const db of server.dbs) db.flush();
+  // As Redis 7.4's flushAllDataAndResetRDB: a BGSAVE still running is stopped, even one past
+  // its walk, whose file holds the old data and would land after the save below. With save
+  // points, the empty dataset is saved at once, so a restart can't bring the old data back.
+  // Not while the AOF replays: that would save a dataset still being rebuilt.
+  server.snapshotJob?.abort('FLUSHALL');
+  if (!server.loading && server.config.get('save').length > 0) saveSnapshot(server);
+  // The save reset `dirty`, and Redis sends FLUSHALL to the AOF and replicas even when every
+  // db was already empty.
+  ctx.forcePropagation();
   ctx.reply.ok();
 }
 

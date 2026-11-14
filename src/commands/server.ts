@@ -1,7 +1,7 @@
 /**
- * Server commands for step 5: COMMAND (COUNT, INFO), CONFIG (GET, SET, RESETSTAT, HELP), TIME
- * and INFO. SAVE, BGSAVE, SHUTDOWN, SLOWLOG, MONITOR, MEMORY and OBJECT come later; DEBUG
- * lives in debug.ts.
+ * Server commands: COMMAND (COUNT, INFO), CONFIG (GET, SET, RESETSTAT, HELP), TIME, INFO, and
+ * the snapshot commands SAVE, BGSAVE and LASTSAVE (step 13). SHUTDOWN, SLOWLOG, MONITOR, MEMORY
+ * and OBJECT come later; DEBUG lives in debug.ts.
  *
  * Key design choice: COMMAND INFO is generated from the command table, so it can never
  * disagree with what the dispatcher enforces. COMMAND DOCS is deliberately not a subcommand:
@@ -9,11 +9,14 @@
  * does with servers older than Redis 7 (spec 8.9).
  *
  * Mirrors Redis server.c (commandCommand, commandInfoCommand, addReplyCommandInfo,
- * timeCommand, infoCommand) and config.c (configGetCommand, configSetCommand,
- * configHelpCommand).
+ * timeCommand, infoCommand), config.c (configGetCommand, configSetCommand,
+ * configHelpCommand) and rdb.c (saveCommand, bgsaveCommand, lastsaveCommand).
  */
 import type { Reply } from '../protocol/encoder.js';
 import { genInfoString } from '../observability/info.js';
+import { saveSnapshot } from '../persistence/snapshot-format.js';
+import { startBgsave } from '../persistence/snapshot-job.js';
+import { ERR, ReplyError } from '../protocol/errors.js';
 import { command, containerOnly, lookupSubcommand } from './command.js';
 import type { CommandContext, CommandFlag, CommandSpec, CommandTable } from './command.js';
 
@@ -179,6 +182,36 @@ export function infoCommand(ctx: CommandContext): void {
   ctx.reply.verbatim(genInfoString(ctx.server, ctx.argv.slice(1)));
 }
 
+/** SAVE blocks the server by design (spec 8.9); refused while a job runs (spec 9.8). */
+export function saveCommand(ctx: CommandContext): void {
+  if (ctx.server.snapshotJob !== null) throw new ReplyError(ERR.BGSAVE_IN_PROGRESS);
+  if (!saveSnapshot(ctx.server)) throw new ReplyError(ERR.BARE);
+  ctx.reply.ok();
+}
+
+/** `BGSAVE [SCHEDULE]`. Replies are Redis 7.4's, checked against the reference. */
+export function bgsaveCommand(ctx: CommandContext): void {
+  const { server, argv } = ctx;
+  // SCHEDULE only matters once an AOF rewrite can be running (step 14); it's accepted now.
+  if (argv.length > 2 || (argv.length === 2 && argv[1]!.toLowerCase() !== 'schedule')) {
+    throw new ReplyError(ERR.SYNTAX);
+  }
+  if (server.snapshotJob !== null) throw new ReplyError(ERR.BGSAVE_IN_PROGRESS);
+  // Inside EXEC (`multi` stays set while the queue runs), as Redis's server.in_exec: a job
+  // started now would see the transaction half done, so serverCron starts it afterwards.
+  if (ctx.client.multi) {
+    server.bgsaveScheduled = true;
+    ctx.reply.simple('Background saving scheduled');
+    return;
+  }
+  if (!startBgsave(server)) throw new ReplyError(ERR.BARE);
+  ctx.reply.simple('Background saving started');
+}
+
+export function lastsaveCommand(ctx: CommandContext): void {
+  ctx.reply.integer(ctx.server.lastSave);
+}
+
 export const serverCommands: CommandSpec[] = [
   command('command', -1, ['stale'], [0, 0, 0], commandCommand, [
     command('command|count', 2, ['stale'], [0, 0, 0], commandCountCommand),
@@ -192,4 +225,7 @@ export const serverCommands: CommandSpec[] = [
   ]),
   command('time', 1, ['stale'], [0, 0, 0], timeCommand),
   command('info', -1, ['stale'], [0, 0, 0], infoCommand),
+  command('save', 1, ['admin', 'nomulti'], [0, 0, 0], saveCommand),
+  command('bgsave', -1, ['admin'], [0, 0, 0], bgsaveCommand),
+  command('lastsave', 1, ['stale'], [0, 0, 0], lastsaveCommand),
 ];

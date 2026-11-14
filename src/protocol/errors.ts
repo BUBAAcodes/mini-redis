@@ -77,6 +77,9 @@ export const ERR = {
   INTERNAL: 'ERR internal error',
   NOT_ALLOWED_IN_MULTI: 'ERR Command not allowed inside a transaction',
   AOF_LOAD_FAILED: 'ERR Error trying to load the AOF files, check server logs.',
+  RDB_LOAD_FAILED: 'ERR Error trying to load the RDB dump, check server logs.',
+  /** Redis's shared.err: a bare `-ERR` (SAVE and BGSAVE when the file can't be written). */
+  BARE: 'ERR',
 } as const;
 
 export const PROTOCOL = {

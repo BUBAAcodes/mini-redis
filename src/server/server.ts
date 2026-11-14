@@ -8,9 +8,12 @@
  * only leave in beforeSleep, so all commands that arrive in one loop turn are answered with
  * one write per client.
  *
- * Startup follows spec 9.9: create `dir`, then (with `appendonly yes`) replay the AOF and open
- * it for appending, all before the listener opens, so no client ever sees a half-loaded
- * dataset. A damaged AOF makes start() reject; it never starts empty over good data.
+ * Startup follows spec 9.9: create `dir` and delete jobs' leftover temp files; then, with
+ * `appendonly yes`, replay the AOF and open it for appending, or else load `dump.mrdb`. All of
+ * it happens before the listener opens, so no client ever sees a half-loaded dataset. A damaged
+ * AOF or snapshot makes start() reject; it never starts empty over good data. (With
+ * `appendonly yes`, no AOF and a snapshot, spec 9.9 loads the snapshot and then rewrites the
+ * AOF; that needs the rewrite, so it arrives with step 14.)
  *
  * Mirrors Redis server.c (initServer, the redisServer struct) and networking.c
  * (acceptTcpHandler, readQueryFromClient, processInputBuffer, freeClient).
@@ -26,6 +29,9 @@ import { buildCommandTable } from '../commands/registry.js';
 import { Config } from '../config.js';
 import type { DictOptions } from '../datastructures/dict.js';
 import { Aof, aofPath, loadAof } from '../persistence/aof.js';
+import { removeLeftoverTemps } from '../persistence/files.js';
+import { loadSnapshotFile, snapshotPath } from '../persistence/snapshot-format.js';
+import type { SnapshotJob } from '../persistence/snapshot-job.js';
 import { ProtocolError } from '../protocol/errors.js';
 import { PubSubHub } from '../pubsub/hub.js';
 import { Db } from '../storage/database.js';
@@ -119,6 +125,18 @@ export class Server {
   aof: Aof | null = null;
   /** True while the AOF is replayed: nothing expires, propagates or counts in the stats. */
   loading = false;
+  /** The one running snapshot job (BGSAVE; AOF rewrite and full sync later), or null (9.8). */
+  snapshotJob: SnapshotJob | null = null;
+  /** Bumped by each job; an object stamped with the running job's epoch is already saved. */
+  snapshotEpoch = 0;
+  /** Numbers the temp files, `temp-<pid>-<n>.mrdb`. */
+  snapshotSeq = 0;
+  /** INFO's rdb_last_bgsave_status; SAVE sets it too, as in Redis. */
+  lastBgsaveStatus: 'ok' | 'err' = 'ok';
+  /** Unix ms of the last BGSAVE attempt: after a failure, save points wait 5 s. */
+  lastBgsaveTry = 0;
+  /** A BGSAVE asked for inside EXEC, started by serverCron once the transaction is over. */
+  bgsaveScheduled = false;
 
   /** Served or timed out this turn: their buffered input runs in the next beforeSleep. */
   private readonly unblockedClients = new Set<Client>();
@@ -147,11 +165,16 @@ export class Server {
 
   /**
    * Loads the data, listens, and starts serverCron. Resolves once connections are accepted;
-   * rejects with AofLoadError (already logged) if the AOF is damaged.
+   * rejects with AofLoadError or SnapshotLoadError (already logged) if the file is damaged.
    */
   async start(): Promise<void> {
-    mkdirSync(this.config.get('dir'), { recursive: true });
+    const dir = this.config.get('dir');
+    mkdirSync(dir, { recursive: true });
+    for (const name of removeLeftoverTemps(dir)) {
+      this.log.notice(`Removed leftover temp file ${name}`);
+    }
     if (this.config.get('appendonly')) this.openAof();
+    else loadSnapshotFile(this, snapshotPath(this));
     const listener = net.createServer((socket) => this.accept(socket));
     this.listener = listener;
     await new Promise<void>((resolve, reject) => {
@@ -171,13 +194,15 @@ export class Server {
   }
 
   /**
-   * Stops accepting, flushes queued replies, closes every connection and resolves when all are
-   * gone. The SHUTDOWN steps that save data (spec 9.14) join in steps 12, 13 and 23.
+   * Stops accepting, aborts a running snapshot job (deleting its temp file), flushes queued
+   * replies, closes every connection and resolves when all are gone. Saving at shutdown
+   * (spec 9.14 step 3) joins in step 23.
    */
   async close(): Promise<void> {
     if (this.shuttingDown) return;
     this.shuttingDown = true;
     this.cron.stop();
+    this.snapshotJob?.abort('shutdown');
     const listening = this.listener;
     const listenerClosed = new Promise<void>((resolve) => {
       if (listening === null) resolve();

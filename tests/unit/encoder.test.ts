@@ -28,6 +28,8 @@ describe('Reply builders (spec 7.3)', () => {
     );
     both((r) => r.error('something broke'), '-ERR something broke\r\n');
     both((r) => r.error('Protocol error: x'), '-ERR Protocol error: x\r\n');
+    // Redis's shared.err, which SAVE sends when the file can't be written.
+    both((r) => r.error('ERR'), '-ERR\r\n');
   });
 
   it('error replaces CR and LF with spaces, as Redis does', () => {
